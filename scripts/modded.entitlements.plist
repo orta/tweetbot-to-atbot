@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Trimmed for ad-hoc / local re-signing. Removed the team-scoped entitlements
+       that require a Tapbots provisioning profile (these caused launch error 153):
+         application-identifier, team-identifier, aps-environment,
+         icloud-*, ubiquity-kvstore-identifier, application-groups,
+         keychain-access-groups.
+       Kept the plain sandbox + capabilities that do NOT need a profile, so the app
+       keeps its existing container at ~/Library/Containers/com.tapbots.Tweetbot3Mac. -->
+  <key>com.apple.security.app-sandbox</key><true/>
+  <key>com.apple.security.network.client</key><true/>
+  <key>com.apple.security.network.server</key><true/>
+  <key>com.apple.security.files.downloads.read-write</key><true/>
+  <key>com.apple.security.files.user-selected.read-write</key><true/>
+  <key>com.apple.security.personal-information.location</key><true/>
+  <!-- debug only: lets lldb attach to diagnose the ~22s watchdog -->
+  <key>com.apple.security.get-task-allow</key><true/>
+</dict>
+</plist>

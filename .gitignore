@@ -1,0 +1,26 @@
+# build output
+build/
+*.dylib
+*.o
+
+# python venv for LIEF injection
+.venv/
+
+# node
+node_modules/
+
+# baked-in credentials — NEVER commit these
+**/atproto.json
+*.app/Contents/Resources/atproto.json
+
+# macOS
+.DS_Store
+
+# builder output (Atbotify.app, release zips)
+dist/
+
+# signing / notarization material — NEVER commit these
+*.p12
+*.p8
+*.cer
+*.mobileprovision

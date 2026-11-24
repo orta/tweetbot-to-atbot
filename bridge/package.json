@@ -1,0 +1,11 @@
+{
+  "name": "tweetbot-atproto-bridge",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Emulates the subset of the Twitter 1.1 API that Tweetbot calls, backed by atproto (Bluesky). Tweetbot talks to this over loopback; this talks XRPC to a PDS.",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node server.mjs"
+  }
+}
