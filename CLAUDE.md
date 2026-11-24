@@ -157,10 +157,28 @@ avoid it. Timeline window: File → New Window. A persisted account auto-reautho
   `<cid>@jpeg?format=jpg&name=<size>` (the CDN ignores the query). Image fetches don't go through
   the hooked NSURLSession task methods, so they never show in the log. To test the rewriter
   directly, `dlopen` `/Applications/Tweetbot.app/.../Model` (rpath to its Frameworks) and call it.
+  URLs that already have an extension (video `thumbnail.jpg`) get it doubled (`thumbnail.jpg.jpg`)
+  so only the copy is stripped.
+- **Video / GIF**: Bluesky GIFs are `app.bsky.embed.video` with `presentation: "gif"` (HLS only,
+  no mp4). Map to Twitter media `type: "animated_gif"` / `"video"` with
+  `video_info.variants: [{content_type: "application/x-mpegURL", url: playlist}]` and the
+  thumbnail as `media_url_https`. `mediumWithEntity:` takes the first HLS variant (for `video`
+  under 4s it hunts for a `video/mp4` by bitrate, falling back to HLS), and AVPlayer streams it.
 - **Detail view re-fetch**: opening a post calls `statuses/show/<id>.json` and Tweetbot
   **merges** the response into its cached status — an empty `{}` wipes media, quote and
   counts. Ids resolve through the post registry (repost wrapper ids too, carrying the reason).
   Quotes = `quoted_status` + `is_quote_status` + `quoted_status_permalink` (one level deep).
+- **Replies under a post** (`PTHTweetbotStatus(ThreadCategory) loadReplyThreads:`, Model
+  framework): Twitter had no replies endpoint, so Tweetbot fakes one with two requests, both
+  with `since_id = <post id> - 1`: `search/tweets.json?q=to:<author> AND filter:replies`
+  (`_PTHTweetbotStatusReplySearchCursor`, which keeps only results whose `in_reply_to_status_id`
+  == the post) and `user_timeline.json?include_rts=0&user_id=<author>`
+  (`_PTHTweetbotStatusPossibleReplyCursor`, which keeps any reply ≠ the post and chains them
+  into threads). Both are answered from `getPostThread`, keyed by `since_id + 1` in the post
+  registry. Tweetbot reads only the **numeric** `in_reply_to_status_id` / `in_reply_to_user_id`
+  (never the `_str` forms), so every reply must carry them. Replies are sorted by numeric
+  TID (`-[PTHTweetbotObject compare:]`). `to:(null)` in the query means the detail re-fetch
+  wiped the author (an empty `statuses/show` answer makes `userWithDictionary:nil`).
 - **Feeds = Twitter lists**: Tweetbot's timeline-title dropdown is filled from `lists/list.json`.
   We answer it with the user's saved feeds (`getPreferences` → `savedFeedsPrefV2`, pinned first,
   skipping the `timeline`/following entry; hydrated via `getFeedGenerators` / `getList`), and

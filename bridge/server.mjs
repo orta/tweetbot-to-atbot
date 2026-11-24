@@ -194,15 +194,49 @@ const routes = [
     return (r.feed || []).map(statusFromFeedItem);
   }],
   ["GET", /\/1\.1\/statuses\/user_timeline\.json/, async (q) => {
+    // Tweetbot's reply-thread loader (_PTHTweetbotStatusPossibleReplyCursor): an
+    // author's timeline since <opened post id> - 1, include_rts=0, from which it keeps
+    // any reply that isn't the post itself. Hand it the whole reply tree under the
+    // post (its result set dedupes across the per-author calls). A plain profile
+    // refresh's since_id is a real post id, so since_id + 1 never resolves for it.
+    const openedId = q.include_rts === "0" ? openedIdForSinceId(q.since_id) : null;
+    if (openedId) return q.max_id ? [] : threadReplyStatuses(openedId, false);
     const actor = resolveActor(q.screen_name || q.user_id, atp.session.did);
     const r = await atp.view("app.bsky.feed.getAuthorFeed", { params: { actor, limit: clampCount(q.count) } });
     return (r.feed || []).map(statusFromFeedItem);
   }],
   ["GET", /\/1\.1\/statuses\/mentions_timeline\.json/, async (q) => {
     const r = await atp.view("app.bsky.notification.listNotifications", { params: { limit: clampCount(q.count) } });
-    return (r.notifications || [])
-      .filter((n) => n.reason === "mention" || n.reason === "reply")
-      .map((n) => statusFromFeedItem({ post: { ...n, record: n.record, author: n.author, uri: n.uri, cid: n.cid } }));
+    // Notifications carry only the raw record (no embed views / counts): hydrate via
+    // getPosts for images, quotes and like/repost/reply counts.
+    const ns = (r.notifications || []).filter((n) => n.reason === "mention" || n.reason === "reply");
+    const hydrated = await atp.getPostsMap(ns.map((n) => n.uri).filter(Boolean)).catch(() => new Map());
+    return ns.map((n) => statusFromFeedItem({ post: hydrated.get(n.uri) || { ...n, record: n.record, author: n.author, uri: n.uri, cid: n.cid } }));
+  }],
+
+  // --- search. The detail view's reply lookup (_PTHTweetbotStatusReplySearchCursor):
+  // q="to:<author> AND filter:replies", since_id = <post id> - 1; it keeps results whose
+  // in_reply_to_status_id is the post. Other searches aren't backed yet: answer an
+  // empty, well-formed result.
+  ["GET", /\/1\.1\/search\/tweets\.json/, async (q) => {
+    const openedId = String(q.q || "").includes("filter:replies") ? openedIdForSinceId(q.since_id) : null;
+    const statuses = openedId && !q.max_id ? await threadReplyStatuses(openedId, true) : [];
+    return { statuses, search_metadata: { count: statuses.length, query: q.q || "", since_id_str: q.since_id || "0" } };
+  }],
+
+  // --- single statuses (detail-view refresh, quoted/linked posts). Tweetbot MERGES
+  // the result into its cached status, so an empty {} wiped media/quotes/counts.
+  ["GET", /\/1\.1\/statuses\/show(?:\/(\d+))?\.json/, async (q, req, m) => {
+    const ref = resolvePostRef(q.id || m[1]);
+    const post = ref && (await atp.getPost(ref.uri));
+    if (!post) return notFound();
+    return statusFromFeedItem(ref.reason ? { post, reason: ref.reason } : { post });
+  }],
+  ["GET", /\/1\.1\/statuses\/lookup\.json/, async (q) => {
+    const refs = String(q.id || "").split(",").map(resolvePostRef);
+    const hydrated = await atp.getPostsMap([...new Set(refs.filter(Boolean).map((r) => r.uri))]);
+    return refs.filter((r) => r && hydrated.has(r.uri))
+      .map((r) => statusFromFeedItem(r.reason ? { post: hydrated.get(r.uri), reason: r.reason } : { post: hydrated.get(r.uri) }));
   }],
 
   // --- lists = Bluesky saved feeds + lists (Tweetbot's timeline title dropdown) ---
@@ -285,6 +319,52 @@ async function resolveList(q) {
   return entry;
 }
 
+// ---- threads (replies under a post) ----
+// Twitter had no "replies to X" endpoint, so when a post's detail view opens Tweetbot
+// (PTHTweetbotStatus(ThreadCategory) loadReplyThreads:) fakes one with two requests,
+// both carrying since_id = <post id> - 1: search/tweets.json (first-level replies) and
+// user_timeline.json include_rts=0 per author (deeper replies, which it chains into
+// threads by in_reply_to_status_id). Both are answered from getPostThread.
+
+// The id of the post the reply loaders are asking about: since_id is it minus one.
+// Only meaningful if it's in the post registry (a real refresh's since_id + 1 isn't).
+function openedIdForSinceId(sinceId) {
+  if (!/^\d+$/.test(String(sinceId || ""))) return null;
+  const id = (BigInt(sinceId) + 1n).toString();
+  return resolvePostRef(id) ? id : null;
+}
+
+// Every reply under `uri` as { post, depth } (1 = direct reply). Cached briefly: one
+// detail view asks for the same thread several times (search + a timeline per author).
+const threadCache = new Map(); // uri -> { at, replies }
+async function threadReplies(uri) {
+  const hit = threadCache.get(uri);
+  if (hit && Date.now() - hit.at < 30_000) return hit.replies;
+  const r = await atp.view("app.bsky.feed.getPostThread", { params: { uri, depth: 10, parentHeight: 0 } });
+  const replies = [];
+  const walk = (node, depth) => {
+    for (const child of node?.replies || []) {
+      if (!child?.post) continue; // notFoundPost / blockedPost
+      replies.push({ post: child.post, depth });
+      walk(child, depth + 1);
+    }
+  };
+  walk(r.thread, 1);
+  threadCache.set(uri, { at: Date.now(), replies });
+  return replies;
+}
+
+// Replies under the opened post as Twitter statuses; `directOnly` keeps first-level
+// ones. Direct replies point in_reply_to_status_id at `openedId` — the id Tweetbot
+// holds for the post — so linkage survives however that id was minted.
+async function threadReplyStatuses(openedId, directOnly) {
+  const replies = await threadReplies(resolvePostRef(openedId).uri);
+  return replies.filter((r) => !directOnly || r.depth === 1).map((r) => {
+    const s = statusFromFeedItem({ post: r.post });
+    return r.depth === 1 ? { ...s, in_reply_to_status_id: Number(openedId), in_reply_to_status_id_str: openedId } : s;
+  });
+}
+
 function clampCount(c) {
   const n = Number(c) || 40;
   return Math.max(1, Math.min(100, n));
@@ -320,6 +400,7 @@ async function synthStatus(uri, cid, record) {
 
 const text = (body, ct = "text/plain") => ({ __raw: true, body, ct });
 const json = (obj) => ({ __raw: true, body: JSON.stringify(obj), ct: "application/json" });
+const notFound = () => ({ __raw: true, status: 404, body: JSON.stringify({ errors: [{ code: 144, message: "No status found with that ID." }] }), ct: "application/json" });
 const redirect = (location) => ({ __redirect: true, location });
 
 const server = http.createServer(async (req, res) => {
@@ -363,7 +444,7 @@ const server = http.createServer(async (req, res) => {
       res.end();
       console.log(`[bridge] ${tag} -> 302 ${out.location}`);
     } else if (out && out.__raw) {
-      res.writeHead(200, { "content-type": out.ct });
+      res.writeHead(out.status || 200, { "content-type": out.ct });
       res.end(out.body);
     } else {
       res.writeHead(200, { "content-type": "application/json" });

@@ -21,6 +21,7 @@ extern void tblog(NSString *fmt, ...);
 
 // ---- forward declarations (definitions live in the shapes section below) ----
 static NSString *stableId(NSString *key);
+static NSString *resolveActor(NSString *param, NSString *fallbackDid);
 static NSMutableDictionary<NSString *, NSString *> *gActorRegistry;      // id/handle -> did
 static NSMutableDictionary<NSString *, NSDictionary *> *gPostRegistry;   // id -> {uri,cid,...}
 
@@ -99,7 +100,14 @@ static id httpRequestJSON(NSString *method, NSString *urlStr,
 static NSString *qstr(NSDictionary *params) {
     if (!params.count) return @"";
     NSMutableArray *parts = [NSMutableArray array];
-    NSCharacterSet *allowed = NSCharacterSet.URLQueryAllowedCharacterSet;
+    // URLQueryAllowedCharacterSet keeps & = + # as-is, but they're delimiters inside a
+    // value (servers decode '+' as a space): feed cursors like "M0Gv…+…" broke paging.
+    static NSCharacterSet *allowed; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSMutableCharacterSet *s = [NSCharacterSet.URLQueryAllowedCharacterSet mutableCopy];
+        [s removeCharactersInString:@"&=+#?"];
+        allowed = s;
+    });
     for (NSString *k in params) {
         id v = params[k];
         if (v == nil || v == NSNull.null) continue;
@@ -249,6 +257,17 @@ static NSDictionary *atpGetPost(NSString *uri, NSString **errOut) {
     return posts.count ? posts[0] : nil;
 }
 
+// Hydrate many post uris at once (getPosts caps at 25 per call). uri -> post view.
+static NSDictionary<NSString *, NSDictionary *> *atpGetPostsMap(NSArray<NSString *> *uris) {
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    for (NSUInteger i = 0; i < uris.count; i += 25) {
+        NSArray *chunk = [uris subarrayWithRange:NSMakeRange(i, MIN(25, uris.count - i))];
+        id r = atpView(@"app.bsky.feed.getPosts", @{ @"uris": chunk }, NULL);
+        for (NSDictionary *p in ([r isKindOfClass:NSDictionary.class] ? r[@"posts"] : @[])) if (p[@"uri"]) out[p[@"uri"]] = p;
+    }
+    return out;
+}
+
 // Build atproto richtext facets (links + @mentions) from plain compose text, with
 // UTF-8 byte offsets, so posted links/mentions are tappable on Bluesky.
 static NSArray *buildFacets(NSString *text) {
@@ -270,7 +289,7 @@ static NSArray *buildFacets(NSString *text) {
     NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"@([a-zA-Z0-9][a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,})" options:0 error:NULL];
     for (NSTextCheckingResult *m in [re matchesInString:text options:0 range:NSMakeRange(0, text.length)]) {
         NSString *handle = [text substringWithRange:[m rangeAtIndex:1]];
-        NSString *did = gActorRegistry[handle.lowercaseString];
+        NSString *did = resolveActor(handle, nil);
         if (!did || [did isEqual:handle]) { // resolve via AppView
             id r = httpRequestJSON(@"GET", [NSString stringWithFormat:@"https://public.api.bsky.app/xrpc/com.atproto.identity.resolveHandle%@", qstr(@{ @"handle": handle })], nil, nil, NULL, NULL);
             did = jsonString(r, @"did");
@@ -305,17 +324,101 @@ static NSString *stableId(NSString *key) {
     return [NSString stringWithFormat:@"%llu", h];
 }
 
+#pragma mark - Status ids (time-ordered, like Twitter snowflakes)
+
+// Tweetbot orders EVERY timeline by numeric id (-[PTHTweetbotObject compare:] compares
+// tids) and pages with since_id/max_id taken from the first/last item, so a status id
+// must grow with time exactly like a Twitter snowflake: ((ms - Twitter epoch) << 22) |
+// 22 low bits. A hash id (stableId) shuffles the timeline. The time comes from the
+// post's rkey — a TID, so the id is a pure function of the at:// uri: a reply's
+// in_reply_to_status_id is computable from its parent's uri alone. User, list and media
+// ids stay on stableId (nothing orders them).
+static const long long kTwitterEpochMs = 1288834974657LL;
+
+static long long nowMs(void) { return (long long)(NSDate.date.timeIntervalSince1970 * 1000.0); }
+static BOOL plausibleMs(long long ms) { return ms > kTwitterEpochMs && ms < nowMs() + 86400000LL; }
+static unsigned long long keyHash(NSString *key) { return strtoull(stableId(key ?: @"").UTF8String, NULL, 10); }
+static long long snowflakeId(long long ms, unsigned long long low) {
+    return ((ms - kTwitterEpochMs) << 22) | (long long)(low & 0x3FFFFF);
+}
+
+// ms since 1970 encoded in a TID record key (base32-sortable: 53 bits of µs + 10-bit
+// clock id); 0 if `rkey` isn't a plausible TID.
+static long long tidMs(NSString *rkey) {
+    static const char *alphabet = "234567abcdefghijklmnopqrstuvwxyz";
+    if (![rkey isKindOfClass:NSString.class] || rkey.length != 13) return 0;
+    unsigned long long v = 0;
+    for (NSUInteger i = 0; i < 13; i++) {
+        unichar c = [rkey characterAtIndex:i];
+        const char *p = (c > 0 && c < 128) ? strchr(alphabet, (char)c) : NULL;
+        if (!p) return 0;
+        v = (v << 5) | (unsigned long long)(p - alphabet);
+    }
+    long long ms = (long long)((v >> 10) / 1000);
+    return plausibleMs(ms) ? ms : 0;
+}
+
+// ms since 1970 for an atproto datetime (any fractional precision); 0 if unparseable.
+static long long isoMs(NSString *iso) {
+    if (![iso isKindOfClass:NSString.class] || !iso.length) return 0;
+    static NSISO8601DateFormatter *frac, *plain; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        frac = [NSISO8601DateFormatter new];
+        frac.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
+        plain = [NSISO8601DateFormatter new];
+    });
+    NSDate *d = [frac dateFromString:iso] ?: [plain dateFromString:iso];
+    if (!d) { // e.g. microsecond precision: drop the fraction
+        NSString *s = [iso stringByReplacingOccurrencesOfString:@"\\.[0-9]+" withString:@"" options:NSRegularExpressionSearch range:NSMakeRange(0, iso.length)];
+        d = [plain dateFromString:s];
+    }
+    long long ms = d ? (long long)(d.timeIntervalSince1970 * 1000.0) : 0;
+    return plausibleMs(ms) ? ms : 0;
+}
+
+// Status id for a post uri: its rkey TID time, else `iso` (createdAt/indexedAt), else a
+// hash (sorts as ancient — only for non-TID rkeys with no date).
+static NSString *postIdWithDate(NSString *uri, NSString *iso) {
+    uri = [uri isKindOfClass:NSString.class] ? uri : @"";
+    long long ms = tidMs(uri.lastPathComponent) ?: isoMs(iso);
+    if (!ms) return stableId(uri);
+    return [NSString stringWithFormat:@"%lld", snowflakeId(ms, keyHash(uri))];
+}
+static NSString *postId(NSString *uri) { return postIdWithDate(uri, nil); }
+static NSString *postIdForPost(NSDictionary *post) {
+    NSDictionary *rec = [post[@"record"] isKindOfClass:NSDictionary.class] ? post[@"record"] : nil;
+    return postIdWithDate(post[@"uri"], rec[@"createdAt"] ?: post[@"indexedAt"]);
+}
+// A repost wrapper sorts by when it was reposted: the repost record's own TID, else
+// the reason's indexedAt.
+static NSString *repostId(NSDictionary *post, NSDictionary *reason) {
+    NSString *rtUri = [reason[@"uri"] isKindOfClass:NSString.class] ? reason[@"uri"] : nil;
+    if (tidMs(rtUri.lastPathComponent)) return postId(rtUri);
+    NSString *key = [NSString stringWithFormat:@"%@#rt:%@", post[@"uri"], reason[@"by"][@"did"] ?: @""];
+    long long ms = isoMs(reason[@"indexedAt"]);
+    return ms ? [NSString stringWithFormat:@"%lld", snowflakeId(ms, keyHash(key))] : stableId(key);
+}
+
 // Reverse registry: Tweetbot addresses users by the numeric id / handle we hand out;
 // atproto needs a DID or handle. Record both so users/show & user_timeline map back.
 static NSMutableDictionary<NSString *, NSString *> *gActorRegistry = nil;
+// Requests are served concurrently (opening a post fires the reply search and the
+// reply-thread timeline at once), so the actor registry needs a lock.
+static NSObject *actorLock(void) {
+    static NSObject *lock; static dispatch_once_t once; dispatch_once(&once, ^{ lock = [NSObject new]; });
+    return lock;
+}
 static void registerActor(NSString *did, NSString *handle) {
-    if (!gActorRegistry) gActorRegistry = [NSMutableDictionary dictionary];
-    if (did.length) { gActorRegistry[stableId(did)] = did; gActorRegistry[did] = did; }
-    if (handle.length) gActorRegistry[handle.lowercaseString] = did ?: handle;
+    @synchronized (actorLock()) {
+        if (!gActorRegistry) gActorRegistry = [NSMutableDictionary dictionary];
+        if (did.length) { gActorRegistry[stableId(did)] = did; gActorRegistry[did] = did; }
+        if (handle.length) gActorRegistry[handle.lowercaseString] = did ?: handle;
+    }
 }
 static NSString *resolveActor(NSString *param, NSString *fallbackDid) {
     if (!param.length) return fallbackDid;
-    NSString *hit = gActorRegistry[param] ?: gActorRegistry[param.lowercaseString];
+    NSString *hit;
+    @synchronized (actorLock()) { hit = gActorRegistry[param] ?: gActorRegistry[param.lowercaseString]; }
     if (hit) return hit;
     BOOL allDigits = [param rangeOfCharacterFromSet:[NSCharacterSet.decimalDigitCharacterSet invertedSet]].location == NSNotFound;
     if (!allDigits && [param containsString:@"."]) return param; // already a handle
@@ -324,19 +427,45 @@ static NSString *resolveActor(NSString *param, NSString *fallbackDid) {
 }
 
 // Post registry: Tweetbot acts on a post by the numeric id we handed out, so record
-// stableId(uri) -> { uri, cid, rootUri, rootCid } whenever we serialize a post, so
-// like/repost/reply/delete can recover the atproto strong-ref.
+// id -> { uri, cid, rootUri, rootCid[, reason] } whenever we serialize a post, so
+// like/repost/reply/delete/statuses/show can recover the atproto strong-ref. A post can
+// be known under several ids (its postId, a repost wrapper id, a ranked-feed id).
 static NSMutableDictionary<NSString *, NSDictionary *> *gPostRegistry = nil;
-static void registerPost(NSDictionary *post) {
+static void registerPostId(NSString *sid, NSDictionary *post, NSDictionary *reason) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{ gPostRegistry = [NSMutableDictionary dictionary]; });
-    NSString *uri = post[@"uri"]; if (!uri.length) return;
+    NSString *uri = post[@"uri"]; if (![uri isKindOfClass:NSString.class] || !uri.length || !sid.length) return;
     NSDictionary *replyRoot = post[@"record"][@"reply"][@"root"];
+    NSMutableDictionary *ref = [@{
+        @"uri": uri, @"cid": post[@"cid"] ?: @"",
+        @"rootUri": replyRoot[@"uri"] ?: uri, @"rootCid": replyRoot[@"cid"] ?: (post[@"cid"] ?: @""),
+    } mutableCopy];
+    if (reason) ref[@"reason"] = reason;
     // locked: redirect.m reads this from the main thread (bridge_post_web_url)
+    @synchronized ([NSMutableDictionary class]) { gPostRegistry[sid] = ref; }
+}
+static void registerPost(NSDictionary *post) { registerPostId(postIdForPost(post), post, nil); }
+
+// A repost wrapper's id (repostId) maps to the original post plus the repost reason,
+// so statuses/show on a retweet id re-emits the same wrapper.
+static void registerRepost(NSString *rtId, NSDictionary *post, NSDictionary *reason) {
+    registerPostId(rtId, post, reason);
+}
+
+// A reply's parent may never have been serialized itself, but Tweetbot will
+// statuses/show it by the in_reply_to_status_id we hand out (the conversation above
+// a reply). Record its strong-ref so that id resolves; a full registerPost wins.
+static void registerReplyParent(NSDictionary *reply) {
+    NSDictionary *parent = reply[@"parent"], *root = reply[@"root"];
+    NSString *uri = [parent isKindOfClass:NSDictionary.class] ? parent[@"uri"] : nil;
+    if (![uri isKindOfClass:NSString.class] || !uri.length) return;
+    if (![root isKindOfClass:NSDictionary.class]) root = parent;
+    NSString *pid = postId(uri);
     @synchronized ([NSMutableDictionary class]) {
-        gPostRegistry[stableId(uri)] = @{
-            @"uri": uri, @"cid": post[@"cid"] ?: @"",
-            @"rootUri": replyRoot[@"uri"] ?: uri, @"rootCid": replyRoot[@"cid"] ?: (post[@"cid"] ?: @""),
+        if (!gPostRegistry || gPostRegistry[pid]) return;
+        gPostRegistry[pid] = @{
+            @"uri": uri, @"cid": parent[@"cid"] ?: @"",
+            @"rootUri": root[@"uri"] ?: uri, @"rootCid": root[@"cid"] ?: (parent[@"cid"] ?: @""),
         };
     }
 }
@@ -397,6 +526,18 @@ static NSUInteger byteToChar(NSString *text, NSUInteger byteOffset) {
     return result;
 }
 
+// Twitter entity `indices` / display_text_range count Unicode CODE POINTS (not UTF-16
+// units): Tweetbot converts them itself, so an emoji before an entity shifts it by one
+// and can push it past the end of the text (entity dropped -> raw t.co shown, no media).
+static NSUInteger cpCount(NSString *s) {
+    NSUInteger n = 0, len = s.length;
+    for (NSUInteger i = 0; i < len; i++) if (!CFStringIsSurrogateLowCharacter([s characterAtIndex:i])) n++;
+    return n;
+}
+static NSUInteger cpAt(NSString *s, NSUInteger utf16Index) {
+    return cpCount([s substringToIndex:MIN(utf16Index, s.length)]);
+}
+
 static NSString *prettyUrl(NSString *uri) {
     NSString *s = uri ?: @"";
     for (NSString *pre in @[@"https://", @"http://"]) if ([s.lowercaseString hasPrefix:pre]) { s = [s substringFromIndex:pre.length]; break; }
@@ -404,6 +545,25 @@ static NSString *prettyUrl(NSString *uri) {
     if ([s hasSuffix:@"/"]) s = [s substringToIndex:s.length - 1];
     if (s.length > 30) s = [[s substringToIndex:27] stringByAppendingString:@"…"];
     return s;
+}
+
+// Tweetbot never loads media_url_https as-is: +[PTHTweetbotMedium
+// twitterMediumURLFromString:sizeName:] rewrites it per size — "x.jpg" -> "x?format=jpg&name=large",
+// and an extension-less path -> "x:large". Bluesky CDN paths have no extension, so
+// "<cid>:large" 400s and the image cell stays blank. "<cid>@jpeg.jpg" becomes
+// "<cid>@jpeg?format=jpg&name=large", which the CDN serves as JPEG (it ignores the query).
+// A URL that already has an extension (video thumbnail.jpg) gets it doubled, so the
+// rewriter strips only the copy: "thumbnail.jpg.jpg" -> "thumbnail.jpg?format=jpg&...".
+static NSString *tweetbotMediaURL(NSString *src) {
+    if (!src.length) return @"";
+    NSString *ext = src.lastPathComponent.pathExtension;
+    if (ext.length) return [src stringByAppendingFormat:@".%@", ext];
+    return [src stringByAppendingString:[src hasSuffix:@"@jpeg"] ? @".jpg" : @"@jpeg.jpg"];
+}
+// Twitter "sizes" entry scaled to fit `box` (keeps the real aspect ratio).
+static NSDictionary *fitSize(double w, double h, double box, NSString *resize) {
+    double k = MIN(1.0, box / MAX(w, h));
+    return @{ @"w": @(lround(w * k)), @"h": @(lround(h * k)), @"resize": resize };
 }
 
 // Render an atproto post record into Twitter text + entities with real `indices`,
@@ -419,7 +579,7 @@ static NSDictionary *renderPost(NSDictionary *rec, NSDictionary *post) {
         NSUInteger ce = byteToChar(text, [index[@"byteEnd"] unsignedIntegerValue]);
         if (ce > text.length) ce = text.length; if (cs > ce) cs = ce;
         NSString *slice = [text substringWithRange:NSMakeRange(cs, ce - cs)];
-        NSArray *idx = @[@(cs), @(ce)];
+        NSArray *idx = @[@(cpAt(text, cs)), @(cpAt(text, ce))];
         for (NSDictionary *feat in (f[@"features"] ?: @[])) {
             NSString *t = feat[@"$type"];
             if ([t isEqual:@"app.bsky.richtext.facet#link"]) {
@@ -437,31 +597,69 @@ static NSDictionary *renderPost(NSDictionary *rec, NSDictionary *post) {
     }
 
     NSMutableString *full = [text mutableCopy];
-    NSUInteger displayEnd = full.length;
+    NSUInteger displayEnd = cpCount(full);
 
     NSDictionary *embed = post[@"embed"];
     NSArray *imgs = embed[@"images"] ?: embed[@"media"][@"images"];
     if ([imgs isKindOfClass:NSArray.class] && imgs.count) {
         NSString *tco = [@"https://t.co/" stringByAppendingString:[stableId(post[@"uri"]) substringToIndex:MIN(10, stableId(post[@"uri"]).length)]];
-        NSUInteger start = full.length + 1;
+        NSUInteger start = cpCount(full) + 1;
         [full appendFormat:@" %@", tco];
-        NSUInteger end = full.length;
+        NSUInteger end = cpCount(full);
         [imgs enumerateObjectsUsingBlock:^(NSDictionary *im, NSUInteger i, BOOL *stop) {
             NSString *src = im[@"fullsize"] ?: im[@"thumb"] ?: @"";
+            NSString *mediaUrl = tweetbotMediaURL(src);
             NSDictionary *ar = im[@"aspectRatio"] ?: @{};
-            NSNumber *w = ar[@"width"] ?: @1200, *h = ar[@"height"] ?: @900;
+            double w = [ar[@"width"] doubleValue] ?: 1200, h = [ar[@"height"] doubleValue] ?: 900;
             NSString *mid = stableId([NSString stringWithFormat:@"%@#img%lu", post[@"uri"], (unsigned long)i]);
             [media addObject:@{
                 @"id_str": mid, @"id": numId(mid), @"type": @"photo",
-                @"media_url": src, @"media_url_https": src, @"url": tco,
+                @"media_url": mediaUrl, @"media_url_https": mediaUrl, @"url": tco,
                 @"display_url": [@"pic.bsky.app/" stringByAppendingString:[stableId(post[@"uri"]) substringToIndex:MIN(6, stableId(post[@"uri"]).length)]],
                 @"expanded_url": src, @"indices": @[@(start), @(end)],
-                @"sizes": @{ @"large": @{@"w": w, @"h": h, @"resize": @"fit"},
-                             @"medium": @{@"w": w, @"h": h, @"resize": @"fit"},
-                             @"small": @{@"w": @680, @"h": @510, @"resize": @"fit"},
+                @"sizes": @{ @"large": fitSize(w, h, 2048, @"fit"),
+                             @"medium": fitSize(w, h, 1200, @"fit"),
+                             @"small": fitSize(w, h, 680, @"fit"),
                              @"thumb": @{@"w": @150, @"h": @150, @"resize": @"crop"} },
                 @"ext_alt_text": im[@"alt"] ?: NSNull.null,
             }];
+        }];
+    }
+
+    // Video (app.bsky.embed.video, also as recordWithMedia's media). Bluesky GIFs are
+    // short videos with presentation "gif". Tweetbot's mediumWithEntity: takes the first
+    // `application/x-mpegURL` variant for video/animated_gif (falling back to it when no
+    // mp4 exists), so the HLS playlist alone is enough; AVPlayer streams it.
+    // media_url_https is the poster frame and goes through the same URL rewriter as photos.
+    NSDictionary *vid = [embed[@"$type"] isEqual:@"app.bsky.embed.video#view"] ? embed
+                      : [embed[@"media"][@"$type"] isEqual:@"app.bsky.embed.video#view"] ? embed[@"media"] : nil;
+    if ([vid[@"playlist"] isKindOfClass:NSString.class]) {
+        NSString *sid = stableId(post[@"uri"] ?: @"");
+        NSString *tco = [@"https://t.co/" stringByAppendingString:[sid substringToIndex:MIN(10, sid.length)]];
+        NSUInteger start = cpCount(full) + 1;
+        [full appendFormat:@" %@", tco];
+        NSUInteger end = cpCount(full);
+        NSDictionary *ar = vid[@"aspectRatio"] ?: @{};
+        double w = [ar[@"width"] doubleValue] ?: 1280, h = [ar[@"height"] doubleValue] ?: 720;
+        BOOL gif = [vid[@"presentation"] isEqual:@"gif"];
+        NSString *poster = tweetbotMediaURL(vid[@"thumbnail"]);
+        NSArray *atParts = [post[@"uri"] hasPrefix:@"at://"] ? [[post[@"uri"] substringFromIndex:5] componentsSeparatedByString:@"/"] : nil;
+        NSString *web = atParts.count >= 3 ? [NSString stringWithFormat:@"https://bsky.app/profile/%@/post/%@", atParts[0], atParts[2]] : vid[@"playlist"];
+        NSString *mid = stableId([post[@"uri"] ?: @"" stringByAppendingString:@"#video"]);
+        [media addObject:@{
+            @"id_str": mid, @"id": numId(mid), @"type": gif ? @"animated_gif" : @"video",
+            @"media_url": poster, @"media_url_https": poster, @"url": tco,
+            @"display_url": [@"pic.bsky.app/" stringByAppendingString:[sid substringToIndex:MIN(6, sid.length)]],
+            @"expanded_url": web, @"indices": @[@(start), @(end)],
+            @"sizes": @{ @"large": fitSize(w, h, 2048, @"fit"),
+                         @"medium": fitSize(w, h, 1200, @"fit"),
+                         @"small": fitSize(w, h, 680, @"fit"),
+                         @"thumb": @{@"w": @150, @"h": @150, @"resize": @"crop"} },
+            @"video_info": @{
+                @"aspect_ratio": @[@(lround(w)), @(lround(h))],
+                @"variants": @[ @{ @"content_type": @"application/x-mpegURL", @"url": vid[@"playlist"] } ],
+            },
+            @"ext_alt_text": vid[@"alt"] ?: NSNull.null,
         }];
     }
 
@@ -469,9 +667,9 @@ static NSDictionary *renderPost(NSDictionary *rec, NSDictionary *post) {
     if ([ext[@"uri"] isKindOfClass:NSString.class]) {
         BOOL already = NO; for (NSDictionary *u in urls) if ([u[@"expanded_url"] isEqual:ext[@"uri"]]) { already = YES; break; }
         if (!already) {
-            NSUInteger start = full.length + 1;
+            NSUInteger start = cpCount(full) + 1;
             [full appendFormat:@" %@", prettyUrl(ext[@"uri"])];
-            [urls addObject:@{ @"url": ext[@"uri"], @"expanded_url": ext[@"uri"], @"display_url": prettyUrl(ext[@"uri"]), @"indices": @[@(start), @(full.length)] }];
+            [urls addObject:@{ @"url": ext[@"uri"], @"expanded_url": ext[@"uri"], @"display_url": prettyUrl(ext[@"uri"]), @"indices": @[@(start), @(cpCount(full))] }];
         }
     }
 
@@ -482,11 +680,56 @@ static NSDictionary *renderPost(NSDictionary *rec, NSDictionary *post) {
     return out;
 }
 
+// The quoted post inside an embed (app.bsky.embed.record / recordWithMedia), as a
+// post-shaped dict (viewRecord carries the record under `value` and media under
+// `embeds`). nil for blocked / deleted / non-post (feed, list, starter pack) embeds.
+static NSDictionary *quotedPost(NSDictionary *embed) {
+    if (![embed isKindOfClass:NSDictionary.class]) return nil;
+    NSString *t = embed[@"$type"];
+    NSDictionary *r = [t isEqual:@"app.bsky.embed.record#view"] ? embed[@"record"]
+                    : [t isEqual:@"app.bsky.embed.recordWithMedia#view"] ? embed[@"record"][@"record"] : nil;
+    if (![r isKindOfClass:NSDictionary.class] || ![r[@"$type"] isEqual:@"app.bsky.embed.record#viewRecord"]) return nil;
+    NSMutableDictionary *p = [NSMutableDictionary dictionary];
+    for (NSString *k in @[@"uri", @"cid", @"author", @"indexedAt", @"likeCount", @"repostCount", @"replyCount", @"quoteCount"]) if (r[k]) p[k] = r[k];
+    p[@"record"] = r[@"value"] ?: @{};
+    NSArray *embeds = r[@"embeds"];
+    if ([embeds isKindOfClass:NSArray.class] && embeds.count) p[@"embed"] = embeds[0];
+    return p;
+}
+
+static NSDictionary *statusFromPost(NSDictionary *post, BOOL allowQuote);
+static NSDictionary *retweetWrapper(NSDictionary *status, NSDictionary *rendered, NSDictionary *post, NSDictionary *reason);
+
+// `item[@"_id"]` (optional) forces the top-level status id: a ranked feed's position id,
+// or the id statuses/show was asked for (Tweetbot merges the reply into the status it
+// holds under that id, so it must come back under the same one).
 static NSDictionary *statusFromFeedItem(NSDictionary *item) {
     NSDictionary *post = item[@"post"] ?: item;
+    NSString *forcedId = [item[@"_id"] isKindOfClass:NSString.class] && [item[@"_id"] length] ? item[@"_id"] : nil;
+    NSDictionary *status = statusFromPost(post, YES);
+    NSDictionary *reason = item[@"reason"];
+    // status carries full_text, so it doubles as the rendered text for the RT wrapper
+    if ([reason[@"$type"] isEqual:@"app.bsky.feed.defs#reasonRepost"]) {
+        NSDictionary *rt = retweetWrapper(status, status, post, reason);
+        if (!forcedId || [rt[@"id_str"] isEqual:forcedId]) return rt;
+        NSMutableDictionary *m = [rt mutableCopy];
+        m[@"id_str"] = forcedId; m[@"id"] = numId(forcedId);
+        registerPostId(forcedId, post, reason);
+        return m;
+    }
+    if (!forcedId || [status[@"id_str"] isEqual:forcedId]) return status;
+    NSMutableDictionary *m = [status mutableCopy];
+    m[@"id_str"] = forcedId; m[@"id"] = numId(forcedId);
+    registerPostId(forcedId, post, nil);
+    return m;
+}
+
+// Twitter status for one hydrated post view. `allowQuote`: attach the embedded quoted
+// post as `quoted_status` (one level only, like Twitter).
+static NSDictionary *statusFromPost(NSDictionary *post, BOOL allowQuote) {
     NSDictionary *rec = post[@"record"] ?: @{};
     registerPost(post);
-    NSString *id_ = stableId(post[@"uri"]);
+    NSString *id_ = postIdForPost(post);
     NSDictionary *rendered = renderPost(rec, post);
     NSMutableDictionary *status = [@{
         @"id_str": id_, @"id": numId(id_),
@@ -498,6 +741,8 @@ static NSDictionary *statusFromFeedItem(NSDictionary *item) {
         @"retweet_count": post[@"repostCount"] ?: @0,
         @"favorite_count": post[@"likeCount"] ?: @0,
         @"reply_count": post[@"replyCount"] ?: @0,
+        @"quote_count": post[@"quoteCount"] ?: @0,
+        @"is_quote_status": @NO,
         @"favorited": @([post[@"viewer"][@"like"] isKindOfClass:NSString.class]),
         @"retweeted": @([post[@"viewer"][@"repost"] isKindOfClass:NSString.class]),
         @"lang": [rec[@"langs"] isKindOfClass:NSArray.class] && [rec[@"langs"] count] ? rec[@"langs"][0] : @"en",
@@ -508,23 +753,51 @@ static NSDictionary *statusFromFeedItem(NSDictionary *item) {
     } mutableCopy];
     if (rendered[@"extended_entities"]) status[@"extended_entities"] = rendered[@"extended_entities"];
 
-    NSDictionary *reason = item[@"reason"];
-    if ([reason[@"$type"] isEqual:@"app.bsky.feed.defs#reasonRepost"]) {
+    // Replies. Tweetbot threads purely on the NUMERIC in_reply_to_status_id /
+    // in_reply_to_user_id (-[PTHTweetbotStatus _updateFromDictionary:] ignores the _str
+    // forms), and its reply loaders keep only results whose in_reply_to_status_id is
+    // the opened post — without these no post ever has replies.
+    NSDictionary *reply = [rec[@"reply"] isKindOfClass:NSDictionary.class] ? rec[@"reply"] : nil;
+    NSString *parentUri = [reply[@"parent"] isKindOfClass:NSDictionary.class] ? reply[@"parent"][@"uri"] : nil;
+    if ([parentUri isKindOfClass:NSString.class] && [parentUri hasPrefix:@"at://"]) {
+        registerReplyParent(reply);
+        NSString *pid = postId(parentUri);
+        NSString *puid = stableId([[parentUri substringFromIndex:5] componentsSeparatedByString:@"/"].firstObject ?: @"");
+        status[@"in_reply_to_status_id"] = numId(pid); status[@"in_reply_to_status_id_str"] = pid;
+        status[@"in_reply_to_user_id"] = numId(puid); status[@"in_reply_to_user_id_str"] = puid;
+    }
+
+    NSDictionary *q = allowQuote ? quotedPost(post[@"embed"]) : nil;
+    if (q[@"uri"]) {
+        NSDictionary *qs = statusFromPost(q, NO);
+        NSString *qsn = [qs[@"user"] isKindOfClass:NSDictionary.class] ? qs[@"user"][@"screen_name"] : @"";
+        NSString *permalink = [NSString stringWithFormat:@"https://twitter.com/%@/status/%@", qsn, qs[@"id_str"]];
+        status[@"is_quote_status"] = @YES;
+        status[@"quoted_status_id_str"] = qs[@"id_str"];
+        status[@"quoted_status_id"] = qs[@"id"];
+        status[@"quoted_status"] = qs;
+        status[@"quoted_status_permalink"] = @{ @"url": permalink, @"expanded": permalink, @"display": prettyUrl(permalink) };
+    }
+    return status;
+}
+
+static NSDictionary *retweetWrapper(NSDictionary *status, NSDictionary *rendered, NSDictionary *post, NSDictionary *reason) {
+    {
         NSDictionary *by = userFromProfile(reason[@"by"]);
         NSString *sn = [status[@"user"] isKindOfClass:NSDictionary.class] ? status[@"user"][@"screen_name"] : @"";
         NSString *rtText = [NSString stringWithFormat:@"RT @%@: %@", sn, rendered[@"full_text"]];
-        NSString *rtId = stableId([NSString stringWithFormat:@"%@#rt:%@", post[@"uri"], reason[@"by"][@"did"] ?: @""]);
+        NSString *rtId = repostId(post, reason);
+        registerRepost(rtId, post, reason);
         return @{
             @"id_str": rtId, @"id": numId(rtId),
             @"created_at": twitterDate(reason[@"indexedAt"]),
             @"user": by, @"text": rtText, @"full_text": rtText,
-            @"display_text_range": @[@0, @(rtText.length)],
+            @"display_text_range": @[@0, @(cpCount(rtText))],
             @"retweeted_status": status,
             @"retweet_count": status[@"retweet_count"], @"favorite_count": status[@"favorite_count"],
             @"entities": @{ @"hashtags": @[], @"urls": @[], @"user_mentions": @[], @"symbols": @[] },
         };
     }
-    return status;
 }
 
 static NSInteger clampCount(NSString *c) {
@@ -532,9 +805,221 @@ static NSInteger clampCount(NSString *c) {
     return MAX(1, MIN(100, n));
 }
 
-static NSArray *mapFeed(id feed) {
+#pragma mark - Paging (since_id / max_id over atproto cursors)
+
+// Tweetbot pages every timeline by id (-[PTHTweetbotTIDCursorPager ...QueryDictionary]):
+// refresh = since_id <newest id>, scroll down = max_id <oldest id - 1>, and when a
+// refresh returns >= 10 statuses that are all newer than what it had it opens a "gap"
+// row, filled with max_id <gap's newest - 1> + since_id <gap's oldest - 1>. It reads
+// the response's first/last status as its newest/oldest, so answers must be newest
+// first, and anything outside (since_id, max_id] must be left out or it re-asks forever.
+// atproto pages with opaque cursors instead, so per timeline we remember the cursor that
+// continues after the oldest status of each page we hand out: a max_id request is
+// "the page after id max_id + 1".
+//
+// Ranked feeds (Discover) aren't in time order, and Tweetbot always re-sorts by id, so
+// time ids would scramble the ranking. A feed whose first page isn't chronological gets
+// RANK ids instead: a refresh is numbered down from "now" in feed order (so each new
+// batch sits on top, in the feed's own order), pages below it continue downwards, and a
+// post keeps its rank id for the session so a refresh never shows it twice.
+
+typedef NSDictionary *(^FeedFetch)(NSString *cursor, NSString **errOut); // -> { feed, cursor }
+
+static const long long kRankStep = 4096; // 12 low bits of hash per rank; 1024 ranks per ms
+
+static NSObject *feedLock(void) {
+    static NSObject *lock; static dispatch_once_t once; dispatch_once(&once, ^{ lock = [NSObject new]; });
+    return lock;
+}
+// key -> { mode: "time"|"rank", cursors: { id -> cursor }, ids: { item key -> rank id } }
+static NSMutableDictionary<NSString *, NSMutableDictionary *> *gFeedStates = nil;
+
+static long long queryId(NSString *s) { return [s isKindOfClass:NSString.class] && s.length ? strtoll(s.UTF8String, NULL, 10) : 0; }
+static long long statusIdOf(NSDictionary *status) { return queryId(status[@"id_str"]); }
+
+// When an item entered the timeline: repost time for reposts, else the post's TID time.
+static long long feedItemMs(NSDictionary *it) {
+    NSDictionary *reason = it[@"reason"], *post = it[@"post"];
+    if ([reason[@"$type"] isEqual:@"app.bsky.feed.defs#reasonRepost"])
+        return tidMs([reason[@"uri"] isKindOfClass:NSString.class] ? [reason[@"uri"] lastPathComponent] : nil) ?: isoMs(reason[@"indexedAt"]);
+    return tidMs([post[@"uri"] isKindOfClass:NSString.class] ? [post[@"uri"] lastPathComponent] : nil)
+        ?: isoMs(post[@"record"][@"createdAt"] ?: post[@"indexedAt"]);
+}
+// Chronological feeds (Following, Mutuals, lists) come back newest-first, give or take
+// a client clock; Discover is ~50% out of order.
+static BOOL looksChronological(NSArray *items) {
+    NSUInteger bad = 0; long long prev = LLONG_MAX;
+    for (NSDictionary *it in items) { long long t = feedItemMs(it); if (t > prev) bad++; prev = t; }
+    return bad <= MAX((NSUInteger)1, items.count / 10);
+}
+// Identity of a feed item for rank-id dedupe (a repost is its own item).
+static NSString *feedItemKey(NSDictionary *it) {
+    NSDictionary *reason = it[@"reason"];
+    NSString *uri = [it[@"post"][@"uri"] isKindOfClass:NSString.class] ? it[@"post"][@"uri"] : @"";
+    if (![reason[@"$type"] isEqual:@"app.bsky.feed.defs#reasonRepost"]) return uri;
+    return [reason[@"uri"] isKindOfClass:NSString.class] ? reason[@"uri"] : [NSString stringWithFormat:@"%@#rt:%@", uri, reason[@"by"][@"did"] ?: @""];
+}
+
+// One Tweetbot page of the timeline `key` (since_id / max_id / count in `query`).
+// `rankable`: a feed generator, which may be ranked rather than chronological.
+static NSArray *pagedFeed(NSString *key, NSDictionary *query, BOOL rankable, FeedFetch fetch, NSString **errOut) {
+    long long since = queryId(query[@"since_id"]), max = queryId(query[@"max_id"]);
+    NSMutableDictionary *st; NSString *mode, *cursor = nil;
+    @synchronized (feedLock()) {
+        if (!gFeedStates) gFeedStates = [NSMutableDictionary dictionary];
+        st = gFeedStates[key];
+        if (!st) gFeedStates[key] = st = [@{ @"cursors": [NSMutableDictionary dictionary], @"ids": [NSMutableDictionary dictionary] } mutableCopy];
+        mode = st[@"mode"];
+        if (max) cursor = st[@"cursors"][[NSString stringWithFormat:@"%lld", max + 1]];
+    }
+    // A max_id we hold no cursor for (shouldn't happen in-process) falls back to walking
+    // down from the top until the pages reach it.
     NSMutableArray *out = [NSMutableArray array];
-    for (NSDictionary *it in ([feed isKindOfClass:NSArray.class] ? feed : @[])) [out addObject:statusFromFeedItem(it)];
+    NSString *next = nil;
+    long long top = max ? max + 1 : snowflakeId(nowMs(), 0); // rank ids are allocated below this
+    NSUInteger rank = 0;
+    for (int page = 0; page < 5; page++) {
+        NSString *pageErr = nil;
+        NSDictionary *r = fetch(cursor, &pageErr);
+        if (![r isKindOfClass:NSDictionary.class]) {
+            if (page == 0) { if (errOut) *errOut = pageErr ?: @"feed request failed"; return nil; }
+            break;
+        }
+        NSArray *items = [r[@"feed"] isKindOfClass:NSArray.class] ? r[@"feed"] : @[];
+        next = [r[@"cursor"] isKindOfClass:NSString.class] && [r[@"cursor"] length] ? r[@"cursor"] : nil;
+        if (!mode) {
+            mode = (rankable && items.count >= 5 && !looksChronological(items)) ? @"rank" : @"time";
+            @synchronized (feedLock()) { st[@"mode"] = mode; }
+            tblog(@"[bridge] feed %@ -> %@ ids", key, mode);
+        }
+        BOOL reachedSince = NO;
+        for (NSDictionary *it in items) {
+            if (![it isKindOfClass:NSDictionary.class] || ![it[@"post"] isKindOfClass:NSDictionary.class]) continue;
+            if ([mode isEqual:@"rank"]) {
+                NSString *k = feedItemKey(it); NSString *known;
+                @synchronized (feedLock()) { known = st[@"ids"][k]; }
+                if (known) continue; // already in this timeline under its rank id
+                long long rid = top - (long long)(rank + 1) * kRankStep + (long long)(keyHash(k) & (kRankStep - 1));
+                if (since && rid <= since) { reachedSince = YES; break; }
+                rank++;
+                NSString *ridStr = [NSString stringWithFormat:@"%lld", rid];
+                @synchronized (feedLock()) {
+                    if ([st[@"ids"] count] > 5000) [st[@"ids"] removeAllObjects];
+                    st[@"ids"][k] = ridStr;
+                }
+                NSMutableDictionary *m = [it mutableCopy]; m[@"_id"] = ridStr;
+                [out addObject:statusFromFeedItem(m)];
+            } else {
+                NSDictionary *s = statusFromFeedItem(it);
+                long long sid = statusIdOf(s);
+                if (max && sid > max) continue;
+                if (since && sid <= since) { reachedSince = YES; continue; }
+                [out addObject:s];
+            }
+        }
+        if (out.count || reachedSince || !next || !items.count) break;
+        cursor = next; // nothing new on this page (all seen / above max_id): keep going
+    }
+    [out sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        long long x = statusIdOf(a), y = statusIdOf(b);
+        return x > y ? NSOrderedAscending : x < y ? NSOrderedDescending : NSOrderedSame;
+    }];
+    if (out.count && next) @synchronized (feedLock()) {
+        if ([st[@"cursors"] count] > 500) [st[@"cursors"] removeAllObjects];
+        st[@"cursors"][[out.lastObject[@"id_str"] description]] = next;
+    }
+    return out;
+}
+
+// Keep statuses inside Tweetbot's (since_id, max_id] window, newest first — for
+// sources we don't page (notifications).
+static NSArray *statusesInRange(NSArray *statuses, NSDictionary *query) {
+    long long since = queryId(query[@"since_id"]), max = queryId(query[@"max_id"]);
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSDictionary *s in statuses) {
+        long long sid = statusIdOf(s);
+        if ((max && sid > max) || (since && sid <= since)) continue;
+        [out addObject:s];
+    }
+    [out sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        long long x = statusIdOf(a), y = statusIdOf(b);
+        return x > y ? NSOrderedAscending : x < y ? NSOrderedDescending : NSOrderedSame;
+    }];
+    return out;
+}
+
+// A FeedFetch for an app.bsky.* view returning { feed, cursor }.
+static FeedFetch viewFetch(NSString *nsid, NSDictionary *params) {
+    return ^NSDictionary *(NSString *cursor, NSString **errOut) {
+        NSMutableDictionary *p = [params mutableCopy];
+        if (cursor) p[@"cursor"] = cursor;
+        id r = atpView(nsid, p, errOut);
+        return [r isKindOfClass:NSDictionary.class] ? r : nil;
+    };
+}
+
+#pragma mark - Threads (replies under a post)
+
+// Twitter had no "replies to X" endpoint, so when a post's detail view opens Tweetbot
+// (PTHTweetbotStatus(ThreadCategory) loadReplyThreads:) fakes one with two requests,
+// both carrying since_id = <post id> - 1:
+//   search/tweets.json   q="to:<author> AND filter:replies"  -> first-level replies
+//   user_timeline.json   include_rts=0 (per author)          -> deeper replies, which
+//                        it chains into threads by in_reply_to_status_id
+// We answer both from app.bsky.feed.getPostThread.
+
+static void collectReplies(id node, NSUInteger depth, NSMutableArray *out) {
+    if (![node isKindOfClass:NSDictionary.class]) return;
+    for (NSDictionary *child in ([node[@"replies"] isKindOfClass:NSArray.class] ? node[@"replies"] : @[])) {
+        // notFoundPost / blockedPost carry no `post`
+        if (![child isKindOfClass:NSDictionary.class] || ![child[@"post"] isKindOfClass:NSDictionary.class]) continue;
+        [out addObject:@{ @"post": child[@"post"], @"depth": @(depth) }];
+        collectReplies(child, depth + 1, out);
+    }
+}
+
+// Every reply under `uri` as { post, depth } (1 = direct reply). Cached briefly: one
+// detail view asks for the same thread several times (search + a timeline per author).
+static NSArray<NSDictionary *> *atpThreadReplies(NSString *uri, NSString **errOut) {
+    static NSMutableDictionary<NSString *, NSArray *> *cache; // uri -> @[date, replies]
+    @synchronized ([NSDate class]) {
+        if (!cache) cache = [NSMutableDictionary dictionary];
+        NSArray *hit = cache[uri];
+        if (hit && -[hit[0] timeIntervalSinceNow] < 30) return hit[1];
+    }
+    id r = atpView(@"app.bsky.feed.getPostThread", @{ @"uri": uri, @"depth": @10, @"parentHeight": @0 }, errOut);
+    if (![r isKindOfClass:NSDictionary.class]) return nil;
+    NSMutableArray *out = [NSMutableArray array];
+    collectReplies(r[@"thread"], 1, out);
+    @synchronized ([NSDate class]) { cache[uri] = @[[NSDate date], out]; }
+    return out;
+}
+
+// The id of the post the reply loaders are asking about: since_id is it minus one.
+// Only meaningful if it's in the post registry (a real refresh's since_id + 1 isn't).
+static NSString *openedIdForSinceId(NSString *sinceId) {
+    unsigned long long v = sinceId.length ? strtoull(sinceId.UTF8String, NULL, 10) : 0;
+    return v && resolvePostRef([NSString stringWithFormat:@"%llu", v + 1]) ? [NSString stringWithFormat:@"%llu", v + 1] : nil;
+}
+
+// Replies under the opened post as Twitter statuses; `directOnly` keeps first-level
+// ones. Direct replies point in_reply_to_status_id at `openedId` — the id Tweetbot
+// holds for the post — so linkage survives however that id was minted.
+static NSArray *threadReplyStatuses(NSString *openedId, BOOL directOnly, NSString **errOut) {
+    NSArray *replies = atpThreadReplies(resolvePostRef(openedId)[@"uri"], errOut);
+    if (!replies) return nil;
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSDictionary *r in replies) {
+        BOOL direct = [r[@"depth"] integerValue] == 1;
+        if (directOnly && !direct) continue;
+        NSDictionary *s = statusFromFeedItem(@{ @"post": r[@"post"] });
+        if (direct) {
+            NSMutableDictionary *m = [s mutableCopy];
+            m[@"in_reply_to_status_id"] = numId(openedId); m[@"in_reply_to_status_id_str"] = openedId;
+            s = m;
+        }
+        [out addObject:s];
+    }
     return out;
 }
 
@@ -684,7 +1169,7 @@ NSString *bridge_oauth_callback_url(void) {
 }
 
 // Exposed for redirect.m: the bsky.app permalink for a status id we handed out
-// (stableId(at-uri)), replacing Tweetbot's https://twitter.com/<name>/status/<id>.
+// (postId(at-uri), or a repost/ranked-feed id), replacing Tweetbot's https://twitter.com/<name>/status/<id>.
 // at://<did>/app.bsky.feed.post/<rkey> -> https://bsky.app/profile/<actor>/post/<rkey>.
 // Prefers the readable handle; falls back to the DID (always valid) when no handle
 // is known, and to the profile page when the post isn't in the registry.
@@ -727,6 +1212,11 @@ static BridgeResp rawResp(NSString *body, NSString *ct) { return (BridgeResp){ 2
 static BridgeResp errResp(NSString *msg) {
     NSData *d = [NSJSONSerialization dataWithJSONObject:@{ @"errors": @[@{ @"code": @131, @"message": msg ?: @"error" }] } options:0 error:NULL];
     return (BridgeResp){ 500, @"application/json", d };
+}
+
+static BridgeResp notFoundResp(void) {
+    NSData *d = [NSJSONSerialization dataWithJSONObject:@{ @"errors": @[@{ @"code": @144, @"message": @"No status found with that ID." }] } options:0 error:NULL];
+    return (BridgeResp){ 404, @"application/json", d };
 }
 
 // Parse multipart form-data field values we care about (uuid) without the receipt blob.
@@ -903,27 +1393,90 @@ static BridgeResp routeRequest(NSString *method, NSString *path, NSDictionary *q
     }
     // ---- timelines ----
     if ([path containsString:@"/statuses/home_timeline"]) {
-        NSString *err = nil; id r = atpView(@"app.bsky.feed.getTimeline", @{ @"limit": @(clampCount(query[@"count"])) }, &err);
-        if (!r) return errResp(err);
-        return jsonResp(mapFeed(r[@"feed"]));
+        NSString *err = nil;
+        NSArray *out = pagedFeed(@"home", query, NO, viewFetch(@"app.bsky.feed.getTimeline", @{ @"limit": @(clampCount(query[@"count"])) }), &err);
+        if (!out) return errResp(err);
+        return jsonResp(out);
     }
     if ([path containsString:@"/statuses/user_timeline"]) {
+        // Tweetbot's reply-thread loader (_PTHTweetbotStatusPossibleReplyCursor): an
+        // author's timeline since <opened post id> - 1, include_rts=0, from which it keeps
+        // any reply that isn't the post itself. Hand it the whole reply tree under the
+        // post (its result set dedupes across the per-author calls). A plain profile
+        // refresh's since_id is a real post id, so since_id + 1 never resolves for it.
+        NSString *openedId = [query[@"include_rts"] isEqual:@"0"] ? openedIdForSinceId(query[@"since_id"]) : nil;
+        if (openedId) {
+            if (query[@"max_id"]) return jsonResp(@[]); // everything came on the first page
+            NSString *err = nil; NSArray *replies = threadReplyStatuses(openedId, NO, &err);
+            if (!replies) return errResp(err);
+            return jsonResp(replies);
+        }
         NSString *actor = resolveActor(query[@"screen_name"] ?: query[@"user_id"], gDID);
-        NSString *err = nil; id r = atpView(@"app.bsky.feed.getAuthorFeed", @{ @"actor": actor ?: @"", @"limit": @(clampCount(query[@"count"])) }, &err);
-        if (!r) return errResp(err);
-        return jsonResp(mapFeed(r[@"feed"]));
+        NSString *err = nil;
+        NSArray *out = pagedFeed([@"author:" stringByAppendingString:actor ?: @""], query, NO,
+                                 viewFetch(@"app.bsky.feed.getAuthorFeed", @{ @"actor": actor ?: @"", @"limit": @(clampCount(query[@"count"])) }), &err);
+        if (!out) return errResp(err);
+        return jsonResp(out);
     }
     if ([path containsString:@"/statuses/mentions_timeline"]) {
         NSString *err = nil; id r = atpView(@"app.bsky.notification.listNotifications", @{ @"limit": @(clampCount(query[@"count"])) }, &err);
         if (!r) return errResp(err);
         NSMutableArray *out = [NSMutableArray array];
+        // Notifications carry only the raw record (no embed views / counts), so hydrate
+        // them via getPosts for images, quotes and like/repost/reply counts.
+        NSMutableArray *uris = [NSMutableArray array];
+        for (NSDictionary *n in (r[@"notifications"] ?: @[]))
+            if (([n[@"reason"] isEqual:@"mention"] || [n[@"reason"] isEqual:@"reply"]) && n[@"uri"]) [uris addObject:n[@"uri"]];
+        NSDictionary *hydrated = atpGetPostsMap(uris);
         for (NSDictionary *n in (r[@"notifications"] ?: @[])) {
             NSString *reason = n[@"reason"];
             if (![reason isEqual:@"mention"] && ![reason isEqual:@"reply"]) continue;
+            NSDictionary *hp = n[@"uri"] ? hydrated[n[@"uri"]] : nil;
+            if (hp) { [out addObject:statusFromFeedItem(@{ @"post": hp })]; continue; }
             [out addObject:statusFromFeedItem(@{ @"post": @{ @"record": n[@"record"] ?: @{}, @"author": n[@"author"] ?: @{}, @"uri": n[@"uri"] ?: @"", @"cid": n[@"cid"] ?: @"", @"indexedAt": n[@"indexedAt"] ?: @"" } })];
+        }
+        return jsonResp(statusesInRange(out, query));
+    }
+    // ---- search ----
+    // The detail view's reply lookup (_PTHTweetbotStatusReplySearchCursor):
+    // q="to:<author> AND filter:replies", since_id = <post id> - 1; it keeps results whose
+    // in_reply_to_status_id is the post. Other searches aren't backed yet: answer an
+    // empty, well-formed result.
+    if ([path containsString:@"/search/tweets"]) {
+        NSString *q = query[@"q"] ?: @"";
+        NSString *openedId = [q containsString:@"filter:replies"] ? openedIdForSinceId(query[@"since_id"]) : nil;
+        NSArray *statuses = @[];
+        if (openedId && !query[@"max_id"]) {
+            NSString *err = nil; statuses = threadReplyStatuses(openedId, YES, &err);
+            if (!statuses) return errResp(err);
+        }
+        return jsonResp(@{ @"statuses": statuses,
+                           @"search_metadata": @{ @"count": @(statuses.count), @"query": q, @"since_id_str": query[@"since_id"] ?: @"0" } });
+    }
+    // ---- single statuses (detail view refresh, quoted/linked posts) ----
+    // Tweetbot re-fetches a post when its detail view opens and MERGES the result, so an
+    // empty {} here wiped media, quotes and counts. Ids are ones we handed out.
+    if ([method isEqual:@"GET"] && [path containsString:@"/statuses/show"]) {
+        NSString *sid = query[@"id"] ?: [path.lastPathComponent stringByDeletingPathExtension];
+        NSDictionary *ref = resolvePostRef(sid);
+        if (!ref) return notFoundResp();
+        NSString *err = nil; NSDictionary *post = atpGetPost(ref[@"uri"], &err);
+        if (!post) return err ? errResp(err) : notFoundResp();
+        return jsonResp(statusFromFeedItem(ref[@"reason"] ? @{ @"post": post, @"reason": ref[@"reason"], @"_id": sid } : @{ @"post": post, @"_id": sid }));
+    }
+    if ([path containsString:@"/statuses/lookup"]) {
+        NSArray *ids = [query[@"id"] ?: @"" componentsSeparatedByString:@","];
+        NSMutableArray *uris = [NSMutableArray array];
+        for (NSString *sid in ids) { NSDictionary *ref = resolvePostRef(sid); if (ref[@"uri"] && ![uris containsObject:ref[@"uri"]]) [uris addObject:ref[@"uri"]]; }
+        NSDictionary *hydrated = atpGetPostsMap(uris);
+        NSMutableArray *out = [NSMutableArray array];
+        for (NSString *sid in ids) {
+            NSDictionary *ref = resolvePostRef(sid); NSDictionary *post = ref[@"uri"] ? hydrated[ref[@"uri"]] : nil;
+            if (post) [out addObject:statusFromFeedItem(ref[@"reason"] ? @{ @"post": post, @"reason": ref[@"reason"], @"_id": sid } : @{ @"post": post, @"_id": sid })];
         }
         return jsonResp(out);
     }
+
     // ---- lists = Bluesky saved feeds (the timeline title dropdown) ----
     if ([path containsString:@"/lists/list"]) {
         NSString *err = nil; NSArray *lists = loadLists(query[@"user_id"], &err);
@@ -935,10 +1488,12 @@ static BridgeResp routeRequest(NSString *method, NSString *path, NSDictionary *q
         if (!entry) return errResp(@"unknown list");
         BOOL isList = [entry[@"kind"] isEqual:@"list"];
         NSString *err = nil;
-        id r = atpView(isList ? @"app.bsky.feed.getListFeed" : @"app.bsky.feed.getFeed",
-                       @{ (isList ? @"list" : @"feed"): entry[@"uri"], @"limit": @(clampCount(query[@"count"])) }, &err);
-        if (!r) return errResp(err);
-        return jsonResp(mapFeed(r[@"feed"]));
+        // List feeds are chronological; feed generators may be ranked (Discover).
+        NSArray *out = pagedFeed(entry[@"uri"], query, !isList,
+                                 viewFetch(isList ? @"app.bsky.feed.getListFeed" : @"app.bsky.feed.getFeed",
+                                           @{ (isList ? @"list" : @"feed"): entry[@"uri"], @"limit": @(clampCount(query[@"count"])) }), &err);
+        if (!out) return errResp(err);
+        return jsonResp(out);
     }
     if ([path containsString:@"/lists/show"]) {
         NSDictionary *entry = resolveList(query);

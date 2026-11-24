@@ -86,6 +86,15 @@ export class AtpClient {
     const r = await this.view("app.bsky.feed.getPosts", { params: { uris: uri } });
     return r.posts?.[0] || null;
   }
+  // Hydrate many uris (getPosts caps at 25 per call) -> Map(uri -> post view).
+  async getPostsMap(uris) {
+    const out = new Map();
+    for (let i = 0; i < uris.length; i += 25) {
+      const r = await this.view("app.bsky.feed.getPosts", { params: { uris: uris.slice(i, i + 25) } });
+      for (const p of r.posts || []) out.set(p.uri, p);
+    }
+    return out;
+  }
   async resolveHandleToDid(handle) {
     try {
       const r = await this.#xrpc("GET", this.appView, "com.atproto.identity.resolveHandle", null, null, { handle });

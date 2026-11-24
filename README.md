@@ -9,7 +9,7 @@ timeline, profiles, and mentions rendering in Tweetbot's original native UI.
 > Tweetbot's servers are gone and its Twitter OAuth is dead, so the app is otherwise a
 > brick. atbot brings it back to life pointed at Bluesky instead.
 
-![atbot showing a Bluesky timeline in Tweetbot's UI](docs/screenshot.png)
+![atbot showing a Bluesky custom feed — photos, mentions and a quote post — in Tweetbot's UI](docs/screenshot.png)
 
 ## Status
 
