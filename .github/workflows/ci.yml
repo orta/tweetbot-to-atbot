@@ -1,0 +1,41 @@
+name: CI
+
+# Compiles everything that ships in the builder app (dylib + Swift engine + GUI, both
+# architectures) and syntax-checks the Node tooling. It cannot run the full transform:
+# that needs a licensed Tweetbot.app, which is never in this repo or on a runner.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax-check Node scripts
+        run: |
+          set -euo pipefail
+          for f in scripts/*.mjs bridge/*.mjs; do node --check "$f"; done
+
+      - name: Build Atbotify.app (ad-hoc signed)
+        run: bash builder/package.sh
+
+      - name: Verify the bundle
+        run: |
+          set -euo pipefail
+          APP=dist/Atbotify.app
+          for bin in Contents/MacOS/Atbotify Contents/Resources/atbotify Contents/Resources/libtweetbot-atproto.dylib; do
+            lipo "$APP/$bin" -verify_arch arm64 x86_64 || { echo "::error::$bin is not universal"; exit 1; }
+          done
+          codesign --verify --deep --strict "$APP"
+          plutil -lint "$APP/Contents/Info.plist"

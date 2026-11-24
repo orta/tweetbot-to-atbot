@@ -73,7 +73,8 @@ and launches it.
 The builder runs the whole transform natively — anti-tamper patch, `LC_LOAD_DYLIB`
 injection, ad-hoc re-sign — using only `ditto` and `codesign`, which ship with macOS.
 Locally-built apps carry no quarantine flag, so the ad-hoc `atbot.app` launches without a
-Gatekeeper prompt (notarize `Atbotify.app` itself before a public release).
+Gatekeeper prompt. Release builds of `Atbotify.app` itself are Developer ID-signed and
+notarized.
 
 ## Building from source
 
@@ -94,6 +95,9 @@ open build/atbot.app
 # ...or build the distributable Make atbot app into ./dist
 bash builder/package.sh
 ```
+
+Releases are cut by pushing a `v*` tag: CI signs, notarizes and publishes `Atbotify.app` to
+GitHub Releases. See [docs/RELEASING.md](docs/RELEASING.md).
 
 The dylib injects into `PTHCommon.framework` (which has ample header padding, unlike the
 main executable) as a simple in-place edit — so the pipeline needs no LIEF/Python.

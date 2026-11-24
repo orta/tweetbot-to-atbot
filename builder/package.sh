@@ -9,6 +9,8 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DIST="$ROOT/dist"
+VERSION="${VERSION:-0.0.0-dev}"          # CFBundleShortVersionString (release.mjs sets it from the tag)
+BUILD_NUMBER="${BUILD_NUMBER:-1}"        # CFBundleVersion
 APP="$DIST/Atbotify.app"
 rm -rf "$DIST"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
@@ -33,7 +35,7 @@ lipo -create "$DIST/gui.arm64" "$DIST/gui.x86" -output "$APP/Contents/MacOS/Atbo
 rm -f "$DIST/gui.arm64" "$DIST/gui.x86"
 
 echo "==> 4. Info.plist"
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -42,18 +44,16 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key><string>io.orta.atbotify</string>
   <key>CFBundleExecutable</key><string>Atbotify</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$BUILD_NUMBER</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PLIST
 
-echo "==> 5. sign (ad-hoc; notarize with a Developer ID before release)"
+echo "==> 5. sign (ad-hoc; scripts/release.mjs re-signs with a Developer ID + notarizes)"
 codesign --force -s - "$APP/Contents/Resources/atbotify" 2>/dev/null || true
 codesign --force -s - "$APP" 2>/dev/null || true
 
 echo "    OK — $APP"
-echo "    (before a public release: sign with a Developer ID and notarize the .app so it"
-echo "     opens without a Gatekeeper prompt. The atbot it generates is built locally and"
-echo "     carries no quarantine flag, so it launches fine ad-hoc.)"
+echo "    (dev build, ad-hoc signed. For a public release run: node scripts/release.mjs)"

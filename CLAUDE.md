@@ -144,9 +144,23 @@ avoid it. Timeline window: File → New Window. A persisted account auto-reautho
   (`registerActor` / `resolveActor`) so `users/show` & `user_timeline` map a numeric id /
   handle back to a DID (unknown all-numeric → the signed-in user).
 - **Entity rendering**: give every facet real `indices` (convert atproto UTF-8 byteStart/End →
-  UTF-16 for NSString), set `display_text_range` to hide a synthetic trailing media URL, clean
+  Unicode **code points**, Twitter's unit — NOT UTF-16: one emoji before an entity shifts it
+  past the end of the text and Tweetbot drops it, showing the raw t.co and no image), set
+  `display_text_range` (also code points) to hide a synthetic trailing media URL, clean
   `display_url`, resolve `@handle` mentions, and put photos in `extended_entities.media` — or
   Tweetbot jams the link/`pic.bsky` text into the start of the post.
+- **Media URLs**: Tweetbot never loads `media_url_https` verbatim —
+  `+[PTHTweetbotMedium twitterMediumURLFromString:sizeName:]` (called from
+  `mediumWithEntity:dictionary:` for the main URL and every `sizes` key) turns `x.jpg` into
+  `x?format=jpg&name=<size>` and an extension-less path into `x:<size>`. Bluesky CDN paths have no
+  extension, so `<cid>:large` 400s → blank image cell. Emit `<fullsize>@jpeg.jpg`, which becomes
+  `<cid>@jpeg?format=jpg&name=<size>` (the CDN ignores the query). Image fetches don't go through
+  the hooked NSURLSession task methods, so they never show in the log. To test the rewriter
+  directly, `dlopen` `/Applications/Tweetbot.app/.../Model` (rpath to its Frameworks) and call it.
+- **Detail view re-fetch**: opening a post calls `statuses/show/<id>.json` and Tweetbot
+  **merges** the response into its cached status — an empty `{}` wipes media, quote and
+  counts. Ids resolve through the post registry (repost wrapper ids too, carrying the reason).
+  Quotes = `quoted_status` + `is_quote_status` + `quoted_status_permalink` (one level deep).
 - **Feeds = Twitter lists**: Tweetbot's timeline-title dropdown is filled from `lists/list.json`.
   We answer it with the user's saved feeds (`getPreferences` → `savedFeedsPrefV2`, pinned first,
   skipping the `timeline`/following entry; hydrated via `getFeedGenerators` / `getList`), and
@@ -172,26 +186,49 @@ avoid it. Timeline window: File → New Window. A persisted account auto-reautho
   shapes. `inject/poc.m` — load-proof POC. `inject/test_hook.m` — deterministic unit test.
 - `bridge/{server,atproto,shapes}.mjs` — Node prototype of the bridge (reference; keep in
   sync with `bridge.m`).
-- `scripts/build-and-inject.sh` — the pipeline. `patch-receipt.mjs` — anti-tamper.
-  `insert_dylib_lief.py` (+ `.venv`) — injection. `modded.entitlements.plist` — trimmed
-  entitlements. `insert-dylib.mjs` / `original.entitlements.plist` — reference.
+- `scripts/build-and-inject.sh` — the full pipeline. `scripts/dev.sh` — fast dylib reload
+  loop. `patch-receipt.mjs` — anti-tamper. `inject-framework.mjs` — in-place `LC_LOAD_DYLIB`
+  injection into PTHCommon (the live one; no LIEF/Python). `modded.entitlements.plist` —
+  trimmed entitlements. Legacy/reference only: `insert_dylib_lief.py` (+ `.venv`),
+  `insert-dylib.mjs`, `original.entitlements.plist`.
+- `builder/atbotify.swift` — native Swift engine (ports receipt-patch + injection, bundles
+  the dylib; end users need only macOS). `builder/AtbotifyGUI.swift` — AppKit front-end.
+  `builder/package.sh` — assembles `dist/Atbotify.app`.
+- `scripts/release.mjs` — Developer ID-sign + notarize + staple `Atbotify.app` →
+  `dist/Atbotify-<version>.zip`. `.github/workflows/release.yml` runs it on a `v*` tag and
+  publishes the GitHub Release; `ci.yml` compiles the builder on push/PR.
+  `scripts/set-github-secrets.mjs` uploads the five `APPLE_*` repo secrets. Details:
+  `docs/RELEASING.md`.
 - `README.md` — human-facing overview. Memory: `tweetbot-atproto-project` in the auto-memory.
 
-## Remaining work
+## Done
 
-- **Write actions**: post/like/repost/follow/delete via `com.atproto.repo.*` + `app.bsky.*`
-  (shapes already stash `_atproto_uri`/`_cid`/`_did`/`_handle` for write-backs). Then DMs,
-  search quality, media upload.
-- **Builder app**: a notarized Mac app on GitHub Releases that transforms the user's installed
-  Tweetbot (prompt for creds → run the pipeline → emit `atbot.app`). Locally-built apps avoid
-  the quarantine flag so the ad-hoc output launches. Blocker to solve: **drop the Python/LIEF
-  dependency** — either bundle a frozen injector or port LIEF's load-command relocation to
-  native code (the arm64 header has no room, so a real Mach-O rebuild is required;
-  `DYLD_INSERT` is out). `codesign` is always present on macOS; `clang` can be avoided by
-  shipping the precompiled dylib.
+- **Reads** (home/mentions/user timelines, profiles, users/show), **feeds+lists** in the
+  dropdown, **in-app OAuth** (one click, no browser), account **persistence**, and the
+  **in-process bridge** (no Node in the shipping app).
+- **Write actions**: post (with link/mention facets)/like/repost/follow/delete via
+  `com.atproto.repo.*` + `app.bsky.*` (shapes stash `_atproto_uri`/`_cid`/`_did`/`_handle`
+  for write-backs; registries `resolvePostRef`/`resolveActor` map numeric ids back). Optimistic
+  like/repost echoes; a just-posted skeet is synthesized locally (AppView indexing lags a
+  re-fetch). **Web permalinks** (bsky.app) for Copy Link / Open in Browser.
+- **Dependency-free injection**: PTHCommon has ~5 KB header padding (the main binary has 16
+  bytes), so `inject-framework.mjs` adds the `LC_LOAD_DYLIB` in place — no LIEF, no relocation.
+  `DYLD_INSERT_LIBRARIES` is out (the sandboxed/signed binary is "restricted", dyld strips it).
+- **Native builder**: `builder/` (Swift engine + AppKit GUI, bundles the precompiled dylib) —
+  end users need only macOS (`ditto` + `codesign` ship with the OS). Locally-built apps carry
+  no quarantine flag, so the ad-hoc `atbot.app` launches. `Atbotify.app` itself is Developer
+  ID-signed + notarized by `scripts/release.mjs` (any new Mach-O in the bundle must be added to
+  its signing step or notarization rejects the build).
+
+## Still TODO
+
+- DMs, search result quality, media upload, richer notifications.
+- **Sync the Node prototype**: lists + web-permalink helpers were added to `bridge.m` only; the
+  `bridge/*.mjs` prototype lacks them. Mirror if you iterate there.
 
 ## Conventions
 
 - Prefer Node for tooling/scripts where there's a choice.
-- Never commit credentials (`atproto.json`, app passwords). They're session-only.
-- When you change bridge behavior, update **both** `bridge.m` and the `bridge/*.mjs` prototype.
+- Never commit credentials. Keep them in a gitignored `./atproto.json` (session-only in chat).
+- When you change bridge behavior, update **both** `bridge.m` and the `bridge/*.mjs` prototype
+  (shipping app = `bridge.m`; the prototype is for fast iteration).
