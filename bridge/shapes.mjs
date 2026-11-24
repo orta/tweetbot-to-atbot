@@ -10,6 +10,53 @@ export function stableId(key) {
   return h.toString();
 }
 
+// ---- status ids: time-ordered, like Twitter snowflakes ---------------------------
+// Tweetbot orders EVERY timeline by numeric id (-[PTHTweetbotObject compare:]) and
+// pages with since_id/max_id from the first/last item, so a status id must grow with
+// time: ((ms - Twitter epoch) << 22) | 22 low bits. The time comes from the post's
+// rkey (a TID), so the id is a pure function of the at:// uri and a reply's
+// in_reply_to_status_id is computable from its parent's uri alone. These exceed 2^53:
+// numeric fields carry BigInts (numId) and server.mjs serializes them exactly.
+const TWITTER_EPOCH_MS = 1288834974657n;
+const TID_ALPHABET = "234567abcdefghijklmnopqrstuvwxyz";
+const plausibleMs = (ms) => ms > Number(TWITTER_EPOCH_MS) && ms < Date.now() + 86400000;
+export const keyHash = (key) => BigInt(stableId(key || ""));
+export const snowflakeId = (ms, low) => ((BigInt(Math.trunc(ms)) - TWITTER_EPOCH_MS) << 22n) | (BigInt(low) & 0x3fffffn);
+// Numeric JSON field for an id string: a BigInt once it's past Number precision.
+export const numId = (s) => { const b = BigInt(s); return b > BigInt(Number.MAX_SAFE_INTEGER) ? b : Number(b); };
+
+// ms since 1970 in a TID record key (53 bits of µs + 10-bit clock id); 0 if not a TID.
+export function tidMs(rkey) {
+  if (typeof rkey !== "string" || rkey.length !== 13) return 0;
+  let v = 0n;
+  for (const ch of rkey) {
+    const i = TID_ALPHABET.indexOf(ch);
+    if (i < 0) return 0;
+    v = ((v << 5n) | BigInt(i)) & 0xffffffffffffffffn;
+  }
+  const ms = Number((v >> 10n) / 1000n);
+  return plausibleMs(ms) ? ms : 0;
+}
+export function isoMs(iso) {
+  const ms = typeof iso === "string" ? Date.parse(iso) : NaN;
+  return Number.isFinite(ms) && plausibleMs(ms) ? ms : 0;
+}
+// Status id for a post uri: rkey TID time, else `iso`, else a hash (sorts as ancient).
+function postIdWithDate(uri, iso) {
+  const ms = tidMs(String(uri || "").split("/").pop()) || isoMs(iso);
+  return ms ? snowflakeId(ms, keyHash(uri)).toString() : stableId(uri || "");
+}
+export const postId = (uri) => postIdWithDate(uri, null);
+const postIdForPost = (post) => postIdWithDate(post?.uri, post?.record?.createdAt || post?.indexedAt);
+// A repost wrapper sorts by when it was reposted: the repost record's TID, else
+// the reason's indexedAt.
+function repostId(post, reason) {
+  if (tidMs(String(reason?.uri || "").split("/").pop())) return postId(reason.uri);
+  const key = post.uri + "#rt:" + (reason?.by?.did || "");
+  const ms = isoMs(reason?.indexedAt);
+  return ms ? snowflakeId(ms, keyHash(key)).toString() : stableId(key);
+}
+
 // Reverse registry: Tweetbot addresses users by the numeric id / screen_name we
 // handed out, but atproto needs a DID or handle. Every user we serialize records
 // stableId(did)->did and handle->did so users/show & user_timeline can map back.
@@ -35,26 +82,22 @@ export function resolveActor(param, fallbackDid) {
 }
 
 // Post registry: map the numeric id we hand out back to the atproto strong-ref so
-// like/repost/reply/delete can recover { uri, cid, rootUri, rootCid }.
+// like/repost/reply/delete/statuses/show can recover { uri, cid, rootUri, rootCid }.
+// A post can be known under several ids (postId, a repost wrapper id, a ranked-feed id).
 const postRegistry = new Map();
-export function registerPost(post) {
-  if (!post?.uri) return;
+function registerPostId(id, post, reason) {
+  if (!post?.uri || !id) return;
   const root = post.record?.reply?.root;
-  postRegistry.set(stableId(post.uri), {
+  postRegistry.set(String(id), {
     uri: post.uri, cid: post.cid || "",
     rootUri: root?.uri || post.uri, rootCid: root?.cid || post.cid || "",
+    ...(reason ? { reason } : {}),
   });
 }
+export function registerPost(post) { registerPostId(postIdForPost(post), post); }
 // A repost wrapper's id maps to the original post + the repost reason, so
 // statuses/show on a retweet id re-emits the same wrapper.
-export function registerRepost(rtId, post, reason) {
-  if (!post?.uri || !rtId) return;
-  const root = post.record?.reply?.root;
-  postRegistry.set(String(rtId), {
-    uri: post.uri, cid: post.cid || "",
-    rootUri: root?.uri || post.uri, rootCid: root?.cid || post.cid || "", reason,
-  });
-}
+export function registerRepost(rtId, post, reason) { registerPostId(rtId, post, reason); }
 export function resolvePostRef(id) { return id == null ? null : postRegistry.get(String(id)) || null; }
 // A reply's parent may never have been serialized itself, but Tweetbot will
 // statuses/show it by the in_reply_to_status_id we hand out (the conversation above
@@ -62,7 +105,7 @@ export function resolvePostRef(id) { return id == null ? null : postRegistry.get
 function registerReplyParent(reply) {
   const parent = reply?.parent, root = reply?.root || parent;
   if (!parent?.uri) return;
-  const pid = stableId(parent.uri);
+  const pid = postId(parent.uri);
   if (postRegistry.has(pid)) return;
   postRegistry.set(pid, {
     uri: parent.uri, cid: parent.cid || "",
@@ -148,12 +191,19 @@ function quotedPost(embed) {
   return { uri, cid, author, indexedAt, likeCount, repostCount, replyCount, quoteCount, record: r.value || {}, embed: r.embeds?.[0] };
 }
 
-// atproto feed post (app.bsky.feed.defs#feedViewPost) -> Twitter status object
+// atproto feed post (app.bsky.feed.defs#feedViewPost) -> Twitter status object.
+// `item._id` (optional) forces the top-level status id: a ranked feed's position id,
+// or the id statuses/show was asked for (Tweetbot merges the reply into the status it
+// holds under that id, so it must come back under the same one).
 export function statusFromFeedItem(item) {
   const post = item.post || item;
+  const forced = item._id ? String(item._id) : null;
+  const isRepost = item.reason?.$type === "app.bsky.feed.defs#reasonRepost";
   const status = statusFromPost(post, true);
-  if (item.reason?.$type === "app.bsky.feed.defs#reasonRepost") return retweetWrapper(status, post, item.reason);
-  return status;
+  const out = isRepost ? retweetWrapper(status, post, item.reason) : status;
+  if (!forced || out.id_str === forced) return out;
+  registerPostId(forced, post, isRepost ? item.reason : undefined);
+  return { ...out, id_str: forced, id: numId(forced) };
 }
 
 // Twitter status for one hydrated post view; `allowQuote` attaches the embedded
@@ -161,11 +211,11 @@ export function statusFromFeedItem(item) {
 function statusFromPost(post, allowQuote) {
   const rec = post.record || {};
   registerPost(post);
-  const id = stableId(post.uri);
+  const id = postIdForPost(post);
   const rendered = renderPost(rec, post);
   const status = {
     id_str: id,
-    id: Number(id),
+    id: numId(id),
     full_text: rendered.full_text,
     text: rendered.full_text,
     display_text_range: rendered.display_text_range,
@@ -196,9 +246,9 @@ function statusFromPost(post, allowQuote) {
   const parentUri = rec.reply?.parent?.uri;
   if (typeof parentUri === "string" && parentUri.startsWith("at://")) {
     registerReplyParent(rec.reply);
-    const pid = stableId(parentUri), puid = stableId(parentUri.slice(5).split("/")[0]);
+    const pid = postId(parentUri), puid = stableId(parentUri.slice(5).split("/")[0]);
     Object.assign(status, {
-      in_reply_to_status_id: Number(pid), in_reply_to_status_id_str: pid,
+      in_reply_to_status_id: numId(pid), in_reply_to_status_id_str: pid,
       in_reply_to_user_id: Number(puid), in_reply_to_user_id_str: puid,
     });
   }
@@ -221,11 +271,11 @@ function statusFromPost(post, allowQuote) {
 function retweetWrapper(status, post, reason) {
   const by = userFromProfile(reason.by);
   const rtText = `RT @${status.user?.screen_name}: ${status.full_text}`;
-  const rtId = stableId(post.uri + "#rt:" + (reason.by?.did || ""));
+  const rtId = repostId(post, reason);
   registerRepost(rtId, post, reason);
   return {
     id_str: rtId,
-    id: Number(rtId),
+    id: numId(rtId),
     created_at: TWITTER_DATE(reason.indexedAt),
     user: by,
     text: rtText,

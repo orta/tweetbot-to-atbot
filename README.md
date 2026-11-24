@@ -1,5 +1,21 @@
 # atbot — Bluesky in Tweetbot
 
+I loved Tweetbot! God, those were the days. Social media felt like it was actually about
+people, and there wasn't a constant push for an algorithm to eat your time. So, I wondered
+if it was possible to bring back the warm and comfy app for Twitter but make it work with
+the closest thing we have to old-twitter: Bluesky.
+
+Now, Tapbots have [Ivory](https://tapbots.com/ivory/) for Mastodon users, but they've not
+committed to Bluesky so I wondered if I could use code-injection to make it possible to run
+support for atproto as an injected dylib inside the app.
+
+Turns out, you can! So, I've cleaned it up a bunch and have given it a few hours of usage.
+
+This repo contains a macOS app, for modding an existing copy of Tweetbot which you should be
+able to install from the Mac App Store.
+
+------
+
 **atbot** turns a copy of the discontinued Mac App Store app **Tweetbot 3.5.8** into a
 native **Bluesky / atproto** client — without rebuilding it. It injects a small dylib
 into your own copy of Tweetbot, intercepts the (now-dead) Twitter API traffic, and
@@ -65,6 +81,8 @@ copy and never redistributes Tapbots' binary) and nothing else: **no Xcode, no P
 Node**. Grab `Atbotify.app` from the release, open it, point it at Tweetbot, enter your
 Bluesky handle + app password, and click **Create atbot…**. It writes a new `atbot.app`
 and launches it.
+
+![The "Make atbot" builder app: pick your Tweetbot, enter a Bluesky handle and app password, click Create atbot…](docs/atbotify.png)
 
 > Use a **Bluesky app password** (bsky.app → Settings → App Passwords), never your main
 > password — it's scoped and revocable. On a custom PDS, leave the PDS field blank and

@@ -191,6 +191,29 @@ avoid it. Timeline window: File → New Window. A persisted account auto-reautho
   list's `user` must be the signed-in user under the id Tweetbot sends as `user_id` on the
   request (NOT the feed's creator, or the lists load as "subscribed" and the menu stays empty).
   Tweetbot sorts the menu alphabetically; same-named feeds get a `(creator.handle)` suffix.
+- **Status ids must be time-ordered (snowflakes)**: every timeline is sorted by numeric tid
+  (`-[PTHTweetbotObject compare:]`), and `PTHTweetbotTIDCursorPager` pages by id. Refresh sends
+  `since_id=<newest>`, scroll-down sends `max_id=<oldest-1>`, and a refresh that returns ≥10
+  statuses all newer than `newestLoadedTID` opens a **gap**, filled with
+  `max_id=<gapNewest-1>&since_id=<gapOldest-1>`. It takes the response's first/last item as
+  newest/oldest. So hash ids (`stableId`) shuffle timelines and loop the gap loader. Status ids
+  are `((ms − 1288834974657) << 22) | hash22`, with `ms` from the post rkey **TID**. That makes
+  them a pure function of the at-uri, so `in_reply_to_status_id` works from the parent uri alone.
+  Repost wrappers use the repost record's TID. Users, lists and media stay on `stableId`. The
+  ids exceed 2^53, so the Node prototype emits them as BigInts (`numId` + `toJSON` in
+  `server.mjs`). `pagedFeed` maps since/max onto atproto cursors (`cursor after id X`), answers
+  newest-first, and drops anything outside `(since_id, max_id]`.
+- **Ranked feeds (Discover)**: time ids would re-sort Discover by date and lose the ranking.
+  A feed generator whose first real page isn't chronological (and Bluesky's `whats-hot`
+  always) gets **rank ids**: each refresh is numbered down from `snowflake(now)` in feed order,
+  pages below continue downwards, and a post keeps its rank id for the session (dedupe, which
+  resets when Tweetbot loads with no since/max). The registry maps rank ids too.
+  `statuses/show` echoes the requested id (`_id`), and thread loaders force direct replies'
+  `in_reply_to` to `since_id+1`. Discover also stops serving posts it has already served you, so
+  heavy testing can drain it to 0 items for a while.
+- **Query encoding**: build XRPC query strings with `&=+#?` percent-encoded.
+  `URLQueryAllowedCharacterSet` leaves `+` alone, the server reads it as a space, and feed
+  cursors containing `+` silently re-serve page 1.
 - **Testing dialog gotcha**: the macOS "unexpectedly quit… Reopen?" loop during testing is a
   self-inflicted artifact of force-killing atbot. Quit cleanly
   (`osascript -e 'tell application "atbot" to quit'`), and/or

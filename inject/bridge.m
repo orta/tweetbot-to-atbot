@@ -869,6 +869,9 @@ static NSArray *pagedFeed(NSString *key, NSDictionary *query, BOOL rankable, Fee
         if (!gFeedStates) gFeedStates = [NSMutableDictionary dictionary];
         st = gFeedStates[key];
         if (!st) gFeedStates[key] = st = [@{ @"cursors": [NSMutableDictionary dictionary], @"ids": [NSMutableDictionary dictionary] } mutableCopy];
+        // No since_id/max_id = Tweetbot holds nothing for this timeline (first load, or
+        // it dropped it): forget which posts it was shown, or a ranked feed comes back empty.
+        if (!since && !max) [st[@"ids"] removeAllObjects];
         mode = st[@"mode"];
         if (max) cursor = st[@"cursors"][[NSString stringWithFormat:@"%lld", max + 1]];
     }
@@ -888,9 +891,17 @@ static NSArray *pagedFeed(NSString *key, NSDictionary *query, BOOL rankable, Fee
         NSArray *items = [r[@"feed"] isKindOfClass:NSArray.class] ? r[@"feed"] : @[];
         next = [r[@"cursor"] isKindOfClass:NSString.class] && [r[@"cursor"] length] ? r[@"cursor"] : nil;
         if (!mode) {
-            mode = (rankable && items.count >= 5 && !looksChronological(items)) ? @"rank" : @"time";
-            @synchronized (feedLock()) { st[@"mode"] = mode; }
-            tblog(@"[bridge] feed %@ -> %@ ids", key, mode);
+            // Judge from a real page only: Discover hands back a near-empty page once it
+            // has served you most of what it has, which would read as "chronological".
+            // Bluesky's own Discover is ranked whatever this page looks like.
+            BOOL discover = [key hasSuffix:@"/app.bsky.feed.generator/whats-hot"];
+            BOOL settled = discover || !rankable || items.count >= 10;
+            mode = !rankable ? @"time"
+                 : (discover || (items.count >= 3 && !looksChronological(items))) ? @"rank" : @"time";
+            if (settled) {
+                @synchronized (feedLock()) { st[@"mode"] = mode; }
+                tblog(@"[bridge] feed %@ -> %@ ids", key, mode);
+            }
         }
         BOOL reachedSince = NO;
         for (NSDictionary *it in items) {
