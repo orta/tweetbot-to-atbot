@@ -41,6 +41,9 @@ Working today (verified end-to-end against a real account on a custom PDS):
 - ✅ **Writes** — post (with link/mention facets), like, repost, follow, delete, all creating
   real atproto records; replies thread correctly
 - ✅ **Web permalinks** — Copy Link / Open in Browser point at `bsky.app`
+- ✅ **Search** — posts (Twitter operators like `from:`, `filter:media`, `min_faves:` work),
+  people, Bluesky trending topics (opening one shows its trending feed), and saved searches;
+  quote-posts of yours show up in Mentions
 - ✅ **In-process bridge** — the whole translation layer runs inside the app (no Node,
   no external server, no open port you manage). A built `atbot.app` is self-contained.
 - ✅ Credentials baked in at build time (`Contents/Resources/atproto.json`)
@@ -49,7 +52,7 @@ Working today (verified end-to-end against a real account on a custom PDS):
 
 Not done yet:
 
-- 💬 DMs, search result quality, media upload
+- 💬 DMs, media upload, `OR` in searches
 - 🔔 Notifications beyond mentions / replies
 
 ## How it works

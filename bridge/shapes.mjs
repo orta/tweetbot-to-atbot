@@ -132,7 +132,7 @@ export async function buildFacets(text, resolveHandle) {
   return facets;
 }
 
-const TWITTER_DATE = (iso) => {
+export const TWITTER_DATE = (iso) => {
   // "Wed Oct 10 20:19:24 +0000 2018"
   const d = iso ? new Date(iso) : new Date();
   const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -183,12 +183,102 @@ const cpAt = (s, utf16Index) => cpLen(s.slice(0, utf16Index));
 
 // The quoted post inside an embed (app.bsky.embed.record / recordWithMedia) as a
 // post-shaped object; null for blocked / deleted / non-post (feed, list) embeds.
-function quotedPost(embed) {
+export function quotedPost(embed) {
   const r = embed?.$type === "app.bsky.embed.record#view" ? embed.record
     : embed?.$type === "app.bsky.embed.recordWithMedia#view" ? embed.record?.record : null;
   if (r?.$type !== "app.bsky.embed.record#viewRecord") return null;
   const { uri, cid, author, indexedAt, likeCount, repostCount, replyCount, quoteCount } = r;
   return { uri, cid, author, indexedAt, likeCount, repostCount, replyCount, quoteCount, record: r.value || {}, embed: r.embeds?.[0] };
+}
+
+// ---- link cards (app.bsky.embed.external) ----
+// Tweetbot has no link-preview view; the only boxed sub-view a status has is the quoted
+// tweet. So an external embed is served as a synthetic `quoted_status`: the page title
+// is the "user" name (the bold line), the site host the screen name, the description
+// plus the link the text, and the thumbnail a photo. Card ids aren't posts, so they
+// live in their own registry (status id and user id -> the JSON we handed out).
+const cardRegistry = new Map();
+export function cardForId(id) { return id == null ? null : cardRegistry.get(String(id)) || null; }
+const trimmed = (v) => (typeof v === "string" ? v.trim() : "");
+// The post's external embed, if it has anything worth a card (else the bare link stays
+// in the text).
+function cardEmbed(post) {
+  const ext = post.embed?.external;
+  if (!ext || typeof ext.uri !== "string" || !ext.uri) return null;
+  if (!trimmed(ext.title) && !trimmed(ext.description) && !trimmed(ext.thumb)) return null;
+  return ext;
+}
+function cardStatus(post, ext) {
+  const uri = ext.uri;
+  let host; try { host = new URL(uri).host; } catch { host = prettyUrl(uri); }
+  host = host.replace(/^www\./i, "");
+  let title = trimmed(ext.title), desc = trimmed(ext.description);
+  const thumb = trimmed(ext.thumb);
+  // GIF picker embeds (Tenor / Klipy) carry a stock title and "ALT: ..." as the description
+  if (host === "media.tenor.com" || host === "static.klipy.com") {
+    title = "GIF";
+    if (/^alt:/i.test(desc)) desc = desc.slice(4).trim();
+  }
+  if (desc.length > 200) desc = desc.slice(0, 199) + "…";
+
+  const key = (post.uri || "") + "#card";
+  const sid = stableId(key), uid = stableId(key + "-site");
+
+  // Tweetbot dedupes users by screen name, so cards sharing a host would share one
+  // "user" (and so one title), and a host that is also a real handle (theguardian.com)
+  // would merge with that account. Make the screen name unique per card with an
+  // invisible suffix: 20 bits of the card id as zero-width space / non-joiner.
+  let screenName = host;
+  for (let i = 0n, bits = BigInt(uid); i < 20n; i++) screenName += (bits >> i) & 1n ? "‌" : "​";
+
+  // The text is the description plus the link. With a thumbnail the link IS the media
+  // entity: the quote box prints a media entity's display_url even when it lies outside
+  // display_text_range, so a separate hidden t.co would show up as a second URL.
+  let full = desc ? desc + "\n" : "";
+  const linkIdx = [cpLen(full), cpLen(full) + cpLen(prettyUrl(uri))];
+  full += prettyUrl(uri);
+  const entities = { hashtags: [], urls: [], user_mentions: [], symbols: [] };
+  let media;
+  if (thumb) {
+    const mid = stableId(key + "-thumb");
+    // og:image has no recorded size; 1.91:1 is the usual card shape
+    media = [{
+      id_str: mid, id: Number(mid), type: "photo",
+      media_url: tweetbotMediaURL(thumb), media_url_https: tweetbotMediaURL(thumb), url: uri,
+      display_url: prettyUrl(uri), expanded_url: uri, indices: linkIdx,
+      sizes: {
+        large: fitSize(1200, 630, 2048, "fit"), medium: fitSize(1200, 630, 1200, "fit"),
+        small: fitSize(1200, 630, 680, "fit"), thumb: { w: 150, h: 150, resize: "crop" },
+      },
+      ext_alt_text: null,
+    }];
+    entities.media = media;
+  } else {
+    entities.urls = [{ url: uri, expanded_url: uri, display_url: prettyUrl(uri), indices: linkIdx }];
+  }
+
+  const created = TWITTER_DATE(post.record?.createdAt || post.indexedAt);
+  const status = {
+    id_str: sid, id: Number(sid),
+    full_text: full, text: full, display_text_range: [0, cpLen(full)],
+    truncated: false, created_at: created,
+    user: {
+      id_str: uid, id: Number(uid),
+      screen_name: screenName, name: title || host,
+      description: desc, location: "", url: uri, protected: false, verified: false,
+      followers_count: 0, friends_count: 0, statuses_count: 0, favourites_count: 0, listed_count: 0,
+      created_at: created, profile_image_url_https: "", profile_image_url: "", profile_banner_url: "",
+      following: false, follow_request_sent: false,
+    },
+    retweet_count: 0, favorite_count: 0, reply_count: 0, quote_count: 0,
+    is_quote_status: false, favorited: false, retweeted: false, lang: "en",
+    source: '<a href="https://bsky.app" rel="nofollow">Bluesky</a>',
+    in_reply_to_status_id_str: null, in_reply_to_screen_name: null,
+    entities, ...(media ? { extended_entities: { media } } : {}),
+    _card_url: uri,
+  };
+  cardRegistry.set(sid, status); cardRegistry.set(uid, status);
+  return status;
 }
 
 // atproto feed post (app.bsky.feed.defs#feedViewPost) -> Twitter status object.
@@ -212,7 +302,10 @@ function statusFromPost(post, allowQuote) {
   const rec = post.record || {};
   registerPost(post);
   const id = postIdForPost(post);
-  const rendered = renderPost(rec, post);
+  const q = allowQuote && quotedPost(post.embed);
+  // A link card takes the quote box when there is no real quote (one box per status).
+  const card = allowQuote && !q?.uri ? cardEmbed(post) : null;
+  const rendered = renderPost(rec, post, !!card);
   const status = {
     id_str: id,
     id: numId(id),
@@ -252,9 +345,8 @@ function statusFromPost(post, allowQuote) {
       in_reply_to_user_id: Number(puid), in_reply_to_user_id_str: puid,
     });
   }
-  const q = allowQuote && quotedPost(post.embed);
-  if (q?.uri) {
-    const qs = statusFromPost(q, false);
+  if (q?.uri || card) {
+    const qs = card ? cardStatus(post, card) : statusFromPost(q, false);
     const permalink = `https://twitter.com/${qs.user?.screen_name}/status/${qs.id_str}`;
     Object.assign(status, {
       is_quote_status: true,
@@ -338,7 +430,9 @@ function prettyUrl(uri) {
 // Render an atproto post record into Twitter-shaped text + entities. Produces real
 // `indices` so links/mentions/tags sit in the right place, a `display_text_range`
 // that hides the synthetic trailing media URL, and `extended_entities` for photos.
-function renderPost(rec, post) {
+// `linkCard`: the external embed is shown as a card (cardStatus), so the trailing link
+// isn't appended to the text.
+function renderPost(rec, post, linkCard) {
   const text = rec.text || "";
   const b2c = byteToCharFn(text);
   const urls = [];
@@ -456,7 +550,7 @@ function renderPost(rec, post) {
   // External link card (app.bsky.embed.external) whose URL isn't already linked in
   // the text: append it as a trailing url entity so it's tappable.
   const ext = post.embed?.external || post.embed?.media?.external;
-  if (ext?.uri && !urls.some((u) => u.expanded_url === ext.uri)) {
+  if (!linkCard && ext?.uri && !urls.some((u) => u.expanded_url === ext.uri)) {
     const tag = " " + prettyUrl(ext.uri);
     const start = cpLen(full) + 1;
     full = full + tag;

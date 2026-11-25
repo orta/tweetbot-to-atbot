@@ -268,6 +268,17 @@ static NSDictionary<NSString *, NSDictionary *> *atpGetPostsMap(NSArray<NSString
     return out;
 }
 
+// Handle (or DID) -> DID: the actor registry first, else the public resolver. nil if unknown.
+static NSString *resolveHandleToDid(NSString *handle) {
+    if (!handle.length) return nil;
+    if ([handle hasPrefix:@"did:"]) return handle;
+    NSString *did = resolveActor(handle, nil);
+    if ([did hasPrefix:@"did:"]) return did;
+    id r = httpRequestJSON(@"GET", [NSString stringWithFormat:@"https://public.api.bsky.app/xrpc/com.atproto.identity.resolveHandle%@", qstr(@{ @"handle": handle })], nil, nil, NULL, NULL);
+    did = jsonString(r, @"did");
+    return did.length ? did : nil;
+}
+
 // Build atproto richtext facets (links + @mentions) from plain compose text, with
 // UTF-8 byte offsets, so posted links/mentions are tappable on Bluesky.
 static NSArray *buildFacets(NSString *text) {
@@ -288,12 +299,7 @@ static NSArray *buildFacets(NSString *text) {
     // @mentions -> resolve handle to DID
     NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"@([a-zA-Z0-9][a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,})" options:0 error:NULL];
     for (NSTextCheckingResult *m in [re matchesInString:text options:0 range:NSMakeRange(0, text.length)]) {
-        NSString *handle = [text substringWithRange:[m rangeAtIndex:1]];
-        NSString *did = resolveActor(handle, nil);
-        if (!did || [did isEqual:handle]) { // resolve via AppView
-            id r = httpRequestJSON(@"GET", [NSString stringWithFormat:@"https://public.api.bsky.app/xrpc/com.atproto.identity.resolveHandle%@", qstr(@{ @"handle": handle })], nil, nil, NULL, NULL);
-            did = jsonString(r, @"did");
-        }
+        NSString *did = resolveHandleToDid([text substringWithRange:[m rangeAtIndex:1]]);
         if (!did.length) continue;
         [facets addObject:@{ @"index": @{ @"byteStart": @(byteAt(m.range.location)), @"byteEnd": @(byteAt(NSMaxRange(m.range))) },
                              @"features": @[@{ @"$type": @"app.bsky.richtext.facet#mention", @"did": did }] }];
@@ -568,7 +574,9 @@ static NSDictionary *fitSize(double w, double h, double box, NSString *resize) {
 
 // Render an atproto post record into Twitter text + entities with real `indices`,
 // a `display_text_range` that hides the synthetic trailing media URL, and media.
-static NSDictionary *renderPost(NSDictionary *rec, NSDictionary *post) {
+// `linkCard`: the post's external embed is shown as a card (see cardStatus), so the
+// trailing link isn't appended to the text.
+static NSDictionary *renderPost(NSDictionary *rec, NSDictionary *post, BOOL linkCard) {
     NSString *text = rec[@"text"] ?: @"";
     NSMutableArray *urls = [NSMutableArray array], *hashtags = [NSMutableArray array],
                    *mentions = [NSMutableArray array], *media = [NSMutableArray array];
@@ -664,7 +672,7 @@ static NSDictionary *renderPost(NSDictionary *rec, NSDictionary *post) {
     }
 
     NSDictionary *ext = embed[@"external"] ?: embed[@"media"][@"external"];
-    if ([ext[@"uri"] isKindOfClass:NSString.class]) {
+    if (!linkCard && [ext[@"uri"] isKindOfClass:NSString.class]) {
         BOOL already = NO; for (NSDictionary *u in urls) if ([u[@"expanded_url"] isEqual:ext[@"uri"]]) { already = YES; break; }
         if (!already) {
             NSUInteger start = cpCount(full) + 1;
@@ -678,6 +686,114 @@ static NSDictionary *renderPost(NSDictionary *rec, NSDictionary *post) {
     NSMutableDictionary *out = [@{ @"full_text": full, @"display_text_range": @[@0, @(displayEnd)], @"entities": entities } mutableCopy];
     if (media.count) out[@"extended_entities"] = @{ @"media": media };
     return out;
+}
+
+#pragma mark - Link cards (app.bsky.embed.external)
+
+// Tweetbot has no link-preview view; the only boxed sub-view a status has is the quoted
+// tweet. So an external embed is served as a synthetic `quoted_status`: the page title
+// is the "user" name (the bold line), the site host the screen name, the description
+// plus the link the text, and the thumbnail a photo. Card ids aren't posts, so they
+// live in their own registry (status id and user id -> the JSON we handed out).
+static NSMutableDictionary<NSString *, NSDictionary *> *gCardRegistry = nil;
+static NSObject *cardLock(void) {
+    static NSObject *lock; static dispatch_once_t once; dispatch_once(&once, ^{ lock = [NSObject new]; });
+    return lock;
+}
+static NSDictionary *cardForId(NSString *sid) {
+    if (![sid isKindOfClass:NSString.class] || !sid.length) return nil;
+    @synchronized (cardLock()) { return gCardRegistry[sid]; }
+}
+static NSString *trimmed(id v) {
+    return [v isKindOfClass:NSString.class] ? [v stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] : @"";
+}
+// The post's external embed, if it has anything worth a card (else the bare link stays
+// in the text).
+static NSDictionary *cardEmbed(NSDictionary *post) {
+    NSDictionary *embed = post[@"embed"];
+    if (![embed isKindOfClass:NSDictionary.class]) return nil;
+    NSDictionary *ext = embed[@"external"];
+    if (![ext isKindOfClass:NSDictionary.class] || ![ext[@"uri"] isKindOfClass:NSString.class] || ![ext[@"uri"] length]) return nil;
+    if (!trimmed(ext[@"title"]).length && !trimmed(ext[@"description"]).length && !trimmed(ext[@"thumb"]).length) return nil;
+    return ext;
+}
+static NSDictionary *cardStatus(NSDictionary *post, NSDictionary *ext) {
+    NSString *uri = ext[@"uri"];
+    NSString *host = [NSURL URLWithString:uri].host ?: prettyUrl(uri);
+    if ([host.lowercaseString hasPrefix:@"www."]) host = [host substringFromIndex:4];
+    NSString *title = trimmed(ext[@"title"]), *desc = trimmed(ext[@"description"]), *thumb = trimmed(ext[@"thumb"]);
+    // GIF picker embeds (Tenor / Klipy) carry a stock title and "ALT: ..." as the description
+    if ([host isEqual:@"media.tenor.com"] || [host isEqual:@"static.klipy.com"]) {
+        title = @"GIF";
+        if ([desc.lowercaseString hasPrefix:@"alt:"]) desc = trimmed([desc substringFromIndex:4]);
+    }
+    if (desc.length > 200) desc = [[desc substringToIndex:[desc rangeOfComposedCharacterSequenceAtIndex:199].location] stringByAppendingString:@"…"];
+
+    NSString *key = [post[@"uri"] ?: @"" stringByAppendingString:@"#card"];
+    NSString *sid = stableId(key), *uid = stableId([key stringByAppendingString:@"-site"]);
+
+    // The text is the description plus the link. With a thumbnail the link IS the media
+    // entity: the quote box prints a media entity's display_url even when it lies outside
+    // display_text_range, so a separate hidden t.co would show up as a second URL.
+    // Tweetbot dedupes users by screen name, so cards sharing a host would share one
+    // "user" (and so one title), and a host that is also a real handle (theguardian.com)
+    // would merge with that account. Make the screen name unique per card with an
+    // invisible suffix: 20 bits of the card id as zero-width space / non-joiner.
+    NSMutableString *screenName = [host mutableCopy];
+    unsigned long long bits = strtoull(uid.UTF8String, NULL, 10);
+    for (int i = 0; i < 20; i++) [screenName appendString:((bits >> i) & 1) ? @"\u200c" : @"\u200b"];
+
+    NSMutableString *full = [desc mutableCopy];
+    if (full.length) [full appendString:@"\n"];
+    NSArray *linkIdx = @[@(cpCount(full)), @(cpCount(full) + cpCount(prettyUrl(uri)))];
+    [full appendString:prettyUrl(uri)];
+    NSUInteger displayEnd = cpCount(full);
+
+    NSMutableDictionary *entities = [@{ @"hashtags": @[], @"urls": @[], @"user_mentions": @[], @"symbols": @[] } mutableCopy];
+    NSArray *media = nil;
+    if (thumb.length) {
+        NSString *mediaUrl = tweetbotMediaURL(thumb);
+        NSString *mid = stableId([key stringByAppendingString:@"-thumb"]);
+        // og:image has no recorded size; 1.91:1 is the usual card shape
+        media = @[@{
+            @"id_str": mid, @"id": numId(mid), @"type": @"photo",
+            @"media_url": mediaUrl, @"media_url_https": mediaUrl, @"url": uri,
+            @"display_url": prettyUrl(uri), @"expanded_url": uri, @"indices": linkIdx,
+            @"sizes": @{ @"large": fitSize(1200, 630, 2048, @"fit"), @"medium": fitSize(1200, 630, 1200, @"fit"),
+                         @"small": fitSize(1200, 630, 680, @"fit"), @"thumb": @{@"w": @150, @"h": @150, @"resize": @"crop"} },
+            @"ext_alt_text": NSNull.null,
+        }];
+        entities[@"media"] = media;
+    } else {
+        entities[@"urls"] = @[@{ @"url": uri, @"expanded_url": uri, @"display_url": prettyUrl(uri), @"indices": linkIdx }];
+    }
+
+    NSString *created = twitterDate(post[@"record"][@"createdAt"] ?: post[@"indexedAt"]);
+    NSDictionary *user = @{
+        @"id_str": uid, @"id": numId(uid),
+        @"screen_name": screenName, @"name": title.length ? title : host,
+        @"description": desc, @"location": @"", @"url": uri, @"protected": @NO, @"verified": @NO,
+        @"followers_count": @0, @"friends_count": @0, @"statuses_count": @0,
+        @"favourites_count": @0, @"listed_count": @0, @"created_at": created,
+        @"profile_image_url_https": @"", @"profile_image_url": @"", @"profile_banner_url": @"",
+        @"following": @NO, @"follow_request_sent": @NO,
+    };
+    NSMutableDictionary *status = [@{
+        @"id_str": sid, @"id": numId(sid),
+        @"full_text": full, @"text": full, @"display_text_range": @[@0, @(displayEnd)],
+        @"truncated": @NO, @"created_at": created, @"user": user,
+        @"retweet_count": @0, @"favorite_count": @0, @"reply_count": @0, @"quote_count": @0,
+        @"is_quote_status": @NO, @"favorited": @NO, @"retweeted": @NO, @"lang": @"en",
+        @"source": @"<a href=\"https://bsky.app\" rel=\"nofollow\">Bluesky</a>",
+        @"in_reply_to_status_id_str": NSNull.null, @"in_reply_to_screen_name": NSNull.null,
+        @"entities": entities, @"_card_url": uri,
+    } mutableCopy];
+    if (media) status[@"extended_entities"] = @{ @"media": media };
+    @synchronized (cardLock()) {
+        if (!gCardRegistry) gCardRegistry = [NSMutableDictionary dictionary];
+        gCardRegistry[sid] = status; gCardRegistry[uid] = status;
+    }
+    return status;
 }
 
 // The quoted post inside an embed (app.bsky.embed.record / recordWithMedia), as a
@@ -730,7 +846,10 @@ static NSDictionary *statusFromPost(NSDictionary *post, BOOL allowQuote) {
     NSDictionary *rec = post[@"record"] ?: @{};
     registerPost(post);
     NSString *id_ = postIdForPost(post);
-    NSDictionary *rendered = renderPost(rec, post);
+    NSDictionary *q = allowQuote ? quotedPost(post[@"embed"]) : nil;
+    // A link card takes the quote box when there is no real quote (one box per status).
+    NSDictionary *card = allowQuote && !q[@"uri"] ? cardEmbed(post) : nil;
+    NSDictionary *rendered = renderPost(rec, post, card != nil);
     NSMutableDictionary *status = [@{
         @"id_str": id_, @"id": numId(id_),
         @"full_text": rendered[@"full_text"], @"text": rendered[@"full_text"],
@@ -767,9 +886,8 @@ static NSDictionary *statusFromPost(NSDictionary *post, BOOL allowQuote) {
         status[@"in_reply_to_user_id"] = numId(puid); status[@"in_reply_to_user_id_str"] = puid;
     }
 
-    NSDictionary *q = allowQuote ? quotedPost(post[@"embed"]) : nil;
-    if (q[@"uri"]) {
-        NSDictionary *qs = statusFromPost(q, NO);
+    if (q[@"uri"] || card) {
+        NSDictionary *qs = card ? cardStatus(post, card) : statusFromPost(q, NO);
         NSString *qsn = [qs[@"user"] isKindOfClass:NSDictionary.class] ? qs[@"user"][@"screen_name"] : @"";
         NSString *permalink = [NSString stringWithFormat:@"https://twitter.com/%@/status/%@", qsn, qs[@"id_str"]];
         status[@"is_quote_status"] = @YES;
@@ -1166,6 +1284,290 @@ static NSDictionary *resolveList(NSDictionary *query) {
     return nil;
 }
 
+#pragma mark - Search (search/tweets, users/search, trends, saved searches)
+
+// Tweetbot's search (PTHTweetbotStatusSearchCursor) sends q = "<what you typed>
+// -filter:retweets" with result_type=recent&count=100 and pages it by id like any
+// timeline (PTHTweetbotTIDCursorPager). app.bsky.feed.searchPosts speaks most of the same
+// operators (from: to: mentions: since: until: lang: domain: #tag "phrase") but none of
+// Twitter's filter:/min_* ones and no OR, so those come out of the query and run as tests
+// on the results instead.
+
+typedef BOOL (^PostTest)(NSDictionary *post);
+
+// The post's embed (or, for a quote with media, its media part) has view type `type`.
+static BOOL postHasEmbed(NSDictionary *post, NSString *type) {
+    NSDictionary *e = post[@"embed"];
+    if (![e isKindOfClass:NSDictionary.class]) return NO;
+    if ([e[@"$type"] isEqual:type]) return YES;
+    NSDictionary *m = e[@"media"];
+    return [m isKindOfClass:NSDictionary.class] && [m[@"$type"] isEqual:type];
+}
+static BOOL postHasLink(NSDictionary *post) {
+    if (postHasEmbed(post, @"app.bsky.embed.external#view")) return YES;
+    NSArray *facets = [post[@"record"] isKindOfClass:NSDictionary.class] ? post[@"record"][@"facets"] : nil;
+    for (NSDictionary *f in ([facets isKindOfClass:NSArray.class] ? facets : @[])) {
+        NSArray *features = [f isKindOfClass:NSDictionary.class] ? f[@"features"] : nil;
+        for (NSDictionary *feat in ([features isKindOfClass:NSArray.class] ? features : @[]))
+            if ([feat isKindOfClass:NSDictionary.class] && [feat[@"$type"] isEqual:@"app.bsky.richtext.facet#link"]) return YES;
+    }
+    return NO;
+}
+// Twitter `filter:<name>` -> a test on a post view (nil = unsupported).
+static PostTest searchFilter(NSString *name) {
+    static NSDictionary<NSString *, PostTest> *tests; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        PostTest images = ^BOOL(NSDictionary *p) { return postHasEmbed(p, @"app.bsky.embed.images#view"); };
+        PostTest videos = ^BOOL(NSDictionary *p) { return postHasEmbed(p, @"app.bsky.embed.video#view"); };
+        tests = @{
+            @"replies": ^BOOL(NSDictionary *p) { return [p[@"record"] isKindOfClass:NSDictionary.class] && [p[@"record"][@"reply"] isKindOfClass:NSDictionary.class]; },
+            @"images": images, @"twimg": images,
+            @"videos": videos, @"native_video": videos,
+            @"media": [^BOOL(NSDictionary *p) { return images(p) || videos(p); } copy],
+            @"links": ^BOOL(NSDictionary *p) { return postHasLink(p); },
+            @"quote": ^BOOL(NSDictionary *p) { return quotedPost(p[@"embed"]) != nil; },
+        };
+    });
+    return name ? tests[name.lowercaseString] : nil;
+}
+
+// Twitter search query -> searchPosts `q`, adding the operators Bluesky lacks to `tests`.
+static NSString *blueskySearchQuery(NSString *q, NSMutableArray<PostTest> *tests) {
+    static NSRegularExpression *tokenRe; static dispatch_once_t once;
+    dispatch_once(&once, ^{ tokenRe = [NSRegularExpression regularExpressionWithPattern:@"-?\"[^\"]*\"|\\S+" options:0 error:NULL]; });
+    NSMutableArray *terms = [NSMutableArray array];
+    for (NSTextCheckingResult *m in [tokenRe matchesInString:q options:0 range:NSMakeRange(0, q.length)]) {
+        NSString *tok = [q substringWithRange:m.range];
+        if ([tok isEqual:@"AND"]) continue; // implicit in both
+        BOOL neg = tok.length > 1 && [tok hasPrefix:@"-"];
+        NSString *body = neg ? [tok substringFromIndex:1] : tok;
+        NSRange colon = [body rangeOfString:@":"];
+        NSString *op = colon.location != NSNotFound ? [body substringToIndex:colon.location].lowercaseString : nil;
+        NSString *arg = colon.location != NSNotFound ? [body substringFromIndex:colon.location + 1] : @"";
+        if ([op isEqual:@"filter"] || [op isEqual:@"exclude"] || [op isEqual:@"include"]) {
+            // Search never returns reposts (so -filter:retweets, which Tweetbot always
+            // appends, holds anyway); unsupported filters are dropped, not searched for.
+            PostTest t = [arg.lowercaseString hasSuffix:@"retweets"] || [op isEqual:@"include"] ? nil : searchFilter(arg);
+            if (!t) continue;
+            PostTest test = (neg || [op isEqual:@"exclude"]) ? ^BOOL(NSDictionary *p) { return !t(p); } : t;
+            [tests addObject:[test copy]];
+            continue;
+        }
+        NSString *countKey = op ? @{ @"min_faves": @"likeCount", @"min_retweets": @"repostCount", @"min_replies": @"replyCount" }[op] : nil;
+        if (countKey) {
+            NSInteger n = arg.integerValue;
+            PostTest test = ^BOOL(NSDictionary *p) { BOOL ok = [p[countKey] integerValue] >= n; return neg ? !ok : ok; };
+            [tests addObject:[test copy]];
+            continue;
+        }
+        if ([op isEqual:@"url"] && arg.length) { // Twitter matches URL text; Bluesky has domain:
+            NSString *host = [arg componentsSeparatedByString:@"/"].firstObject;
+            [terms addObject:[(neg ? @"-domain:" : @"domain:") stringByAppendingString:host]];
+            continue;
+        }
+        [terms addObject:tok];
+    }
+    return [terms componentsJoinedByString:@" "];
+}
+
+// A FeedFetch over searchPosts (posts -> feed items) keeping only posts that pass
+// `tests`. pagedFeed stops at an empty page, so a page the tests empty out moves on.
+static FeedFetch searchFetch(NSString *bq, NSString *sort, NSInteger limit, NSArray<PostTest> *tests) {
+    return ^NSDictionary *(NSString *cursor, NSString **errOut) {
+        for (int page = 0; page < 3; page++) {
+            NSMutableDictionary *p = [@{ @"q": bq, @"sort": sort, @"limit": @(limit) } mutableCopy];
+            if (cursor) p[@"cursor"] = cursor;
+            id r = atpView(@"app.bsky.feed.searchPosts", p, errOut);
+            if (![r isKindOfClass:NSDictionary.class]) return nil;
+            NSArray *posts = [r[@"posts"] isKindOfClass:NSArray.class] ? r[@"posts"] : @[];
+            NSMutableArray *feed = [NSMutableArray array];
+            for (NSDictionary *post in posts) {
+                if (![post isKindOfClass:NSDictionary.class]) continue;
+                BOOL ok = YES; for (PostTest t in tests) if (!t(post)) { ok = NO; break; }
+                if (ok) [feed addObject:@{ @"post": post }];
+            }
+            NSString *next = [r[@"cursor"] isKindOfClass:NSString.class] && [r[@"cursor"] length] ? r[@"cursor"] : nil;
+            if (feed.count || !next || !posts.count || page == 2) return next ? @{ @"feed": feed, @"cursor": next } : @{ @"feed": feed };
+            cursor = next;
+        }
+        return @{ @"feed": @[] };
+    };
+}
+
+// Mentions mixes in quotes of your posts (-[PTHTweetbotCurrentUserMentionsCursor
+// _loadQuotesSinceTID:maxTID:block:]): it ORs the links of your recent posts (their
+// twitterURL, which redirect.m points at bsky.app) into one search and keeps results that
+// quote you. Bluesky answers that directly: app.bsky.feed.getQuotes. A query that is
+// nothing but bsky.app post links -> their at:// uris (getQuotes wants the DID form);
+// nil for any other query.
+static NSArray<NSString *> *quotedPostUris(NSString *bq) {
+    static NSRegularExpression *re; static dispatch_once_t once;
+    dispatch_once(&once, ^{ re = [NSRegularExpression regularExpressionWithPattern:@"^https?://(?:www\\.)?bsky\\.app/profile/([^/\\s]+)/post/([^/\\s?#]+)/?$" options:NSRegularExpressionCaseInsensitive error:NULL]; });
+    NSMutableArray<NSArray *> *links = [NSMutableArray array]; // [actor, rkey]
+    for (NSString *tok in [bq componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceCharacterSet]) {
+        if (!tok.length || [tok isEqual:@"OR"]) continue;
+        NSTextCheckingResult *m = [re firstMatchInString:tok options:0 range:NSMakeRange(0, tok.length)];
+        if (!m) return nil;
+        [links addObject:@[[tok substringWithRange:[m rangeAtIndex:1]], [tok substringWithRange:[m rangeAtIndex:2]]]];
+    }
+    NSMutableArray *uris = [NSMutableArray array];
+    for (NSArray *l in links) {
+        NSString *did = resolveHandleToDid(l[0]);
+        if (did) [uris addObject:[NSString stringWithFormat:@"at://%@/app.bsky.feed.post/%@", did, l[1]]];
+    }
+    return links.count ? uris : nil;
+}
+static NSArray *quoteStatuses(NSArray<NSString *> *uris, NSDictionary *query) {
+    NSMutableArray *out = [NSMutableArray array]; NSMutableSet *seen = [NSMutableSet set];
+    for (NSString *uri in uris) {
+        id r = atpView(@"app.bsky.feed.getQuotes", @{ @"uri": uri, @"limit": @50 }, NULL);
+        NSArray *posts = [r isKindOfClass:NSDictionary.class] && [r[@"posts"] isKindOfClass:NSArray.class] ? r[@"posts"] : @[];
+        for (NSDictionary *post in posts) {
+            if (![post isKindOfClass:NSDictionary.class] || ![post[@"uri"] isKindOfClass:NSString.class] || [seen containsObject:post[@"uri"]]) continue;
+            [seen addObject:post[@"uri"]];
+            [out addObject:statusFromFeedItem(@{ @"post": post })];
+        }
+    }
+    return statusesInRange(out, query);
+}
+
+// Trends (the search view's trend list) = Bluesky's trending topics. Each is backed by a
+// feed (link "/profile/<did>/feed/<rkey>"), and opening a trend searches its `query`
+// (Tweetbot urlDecodes it), so the trend's name maps back to that feed here and the
+// search is answered from the feed instead of a text search for the headline.
+static NSMutableDictionary<NSString *, NSString *> *gTrendFeeds = nil; // normalized name -> feed uri
+static NSObject *trendLock(void) {
+    static NSObject *lock; static dispatch_once_t once; dispatch_once(&once, ^{ lock = [NSObject new]; });
+    return lock;
+}
+static NSString *trendKey(NSString *s) {
+    NSArray *words = [s.lowercaseString componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    return [[words filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"length > 0"]] componentsJoinedByString:@" "];
+}
+static NSString *trendFeedForQuery(NSString *bq) {
+    @synchronized (trendLock()) { return gTrendFeeds[trendKey(bq)]; }
+}
+// "/profile/<actor>/feed/<rkey>" -> at://<did>/app.bsky.feed.generator/<rkey>
+static NSString *feedUriFromLink(NSString *link) {
+    NSArray<NSString *> *parts = [link componentsSeparatedByString:@"/"];
+    if (parts.count != 5 || ![parts[1] isEqual:@"profile"] || ![parts[3] isEqual:@"feed"] || !parts[4].length) return nil;
+    NSString *did = resolveHandleToDid(parts[2]);
+    return did ? [NSString stringWithFormat:@"at://%@/app.bsky.feed.generator/%@", did, parts[4]] : nil;
+}
+static NSArray *loadTrends(NSString **errOut) {
+    id r = atpView(@"app.bsky.unspecced.getTrends", @{ @"limit": @25 }, NULL);
+    NSArray *items = [r isKindOfClass:NSDictionary.class] && [r[@"trends"] isKindOfClass:NSArray.class] ? r[@"trends"] : nil;
+    if (!items) { // AppViews without getTrends: topics only (no post counts)
+        r = atpView(@"app.bsky.unspecced.getTrendingTopics", @{ @"limit": @25 }, errOut);
+        items = [r isKindOfClass:NSDictionary.class] && [r[@"topics"] isKindOfClass:NSArray.class] ? r[@"topics"] : nil;
+    }
+    if (!items) return nil;
+    NSCharacterSet *ws = NSCharacterSet.whitespaceAndNewlineCharacterSet;
+    NSMutableArray *trends = [NSMutableArray array];
+    for (NSDictionary *t in items) {
+        if (![t isKindOfClass:NSDictionary.class]) continue;
+        NSString *name = [jsonString(t, @"displayName") stringByTrimmingCharactersInSet:ws];
+        if (!name.length) name = [jsonString(t, @"topic") stringByTrimmingCharactersInSet:ws];
+        if (!name.length) continue;
+        NSString *link = jsonString(t, @"link") ?: @"", *searchQ = name;
+        NSString *feed = feedUriFromLink(link);
+        if (feed) @synchronized (trendLock()) {
+            if (!gTrendFeeds) gTrendFeeds = [NSMutableDictionary dictionary];
+            gTrendFeeds[trendKey(name)] = feed;
+        } else if ([link hasPrefix:@"/search?q="]) {
+            searchQ = [[link substringFromIndex:10] stringByRemovingPercentEncoding] ?: name;
+        }
+        [trends addObject:@{
+            @"name": name,
+            @"query": [searchQ stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.alphanumericCharacterSet] ?: name,
+            @"url": [@"https://bsky.app" stringByAppendingString:link],
+            @"tweet_volume": [t[@"postCount"] isKindOfClass:NSNumber.class] ? t[@"postCount"] : NSNull.null,
+            @"promoted_content": NSNull.null,
+        }];
+    }
+    return trends;
+}
+
+// search/tweets for anything but the reply lookup.
+static NSArray *searchStatuses(NSString *q, NSDictionary *query, NSString **errOut) {
+    NSMutableArray<PostTest> *tests = [NSMutableArray array];
+    NSString *bq = blueskySearchQuery(q, tests);
+    if (!bq.length) return @[]; // nothing left to search for (searchPosts needs a q)
+    NSArray *quoted = quotedPostUris(bq);
+    if (quoted) return quoteStatuses(quoted, query);
+    NSInteger limit = clampCount(query[@"count"]);
+    NSString *trendFeed = trendFeedForQuery(bq);
+    if (trendFeed) return pagedFeed(trendFeed, query, YES, viewFetch(@"app.bsky.feed.getFeed", @{ @"feed": trendFeed, @"limit": @(limit) }), errOut);
+    // "popular" is ranked: rank ids keep searchPosts' order through Tweetbot's id sort.
+    NSString *sort = [query[@"result_type"] isEqual:@"popular"] ? @"top" : @"latest";
+    return pagedFeed([NSString stringWithFormat:@"search:%@:%@", sort, q], query, [sort isEqual:@"top"],
+                     searchFetch(bq, sort, limit, tests), errOut);
+}
+
+// users/search (PTHTweetbotUserSearchCursor): only `q`, one page, no paging.
+// searchActors returns basic profiles without counts, so hydrate via getProfiles.
+static NSArray *searchUsers(NSString *q, NSString **errOut) {
+    q = [q stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if ([q hasPrefix:@"@"]) q = [q substringFromIndex:1];
+    if (!q.length) return @[];
+    id r = atpView(@"app.bsky.actor.searchActors", @{ @"q": q, @"limit": @50 }, errOut);
+    if (![r isKindOfClass:NSDictionary.class]) return nil;
+    NSMutableArray *actors = [NSMutableArray array], *dids = [NSMutableArray array];
+    for (NSDictionary *a in ([r[@"actors"] isKindOfClass:NSArray.class] ? r[@"actors"] : @[]))
+        if (jsonString(a, @"did")) { [actors addObject:a]; [dids addObject:a[@"did"]]; }
+    NSMutableDictionary *full = [NSMutableDictionary dictionary];
+    for (NSUInteger i = 0; i < dids.count; i += 25) {
+        id pr = atpView(@"app.bsky.actor.getProfiles", @{ @"actors": [dids subarrayWithRange:NSMakeRange(i, MIN(25, dids.count - i))] }, NULL);
+        for (NSDictionary *p in ([pr isKindOfClass:NSDictionary.class] && [pr[@"profiles"] isKindOfClass:NSArray.class] ? pr[@"profiles"] : @[]))
+            if (jsonString(p, @"did")) full[p[@"did"]] = p;
+    }
+    NSMutableArray *users = [NSMutableArray array];
+    for (NSDictionary *a in actors) [users addObject:userFromProfile(full[a[@"did"]] ?: a)];
+    return users;
+}
+
+// Saved searches: Bluesky keeps none server-side, so they live in the app's own
+// defaults (the sandbox container, so they survive relaunches and dylib reloads).
+// Stored as { id, query, createdAt }; id = stableId(query), so saving twice is a no-op.
+static NSString *const kSavedSearchesKey = @"atbotSavedSearches";
+static NSObject *savedSearchLock(void) {
+    static NSObject *lock; static dispatch_once_t once; dispatch_once(&once, ^{ lock = [NSObject new]; });
+    return lock;
+}
+static NSArray<NSDictionary *> *savedSearches(void) {
+    NSArray *a = [NSUserDefaults.standardUserDefaults arrayForKey:kSavedSearchesKey];
+    return [a isKindOfClass:NSArray.class] ? a : @[];
+}
+static NSDictionary *savedSearchJSON(NSDictionary *s) {
+    NSString *sid = [s[@"id"] description] ?: @"0";
+    return @{ @"id": numId(sid), @"id_str": sid, @"name": s[@"query"] ?: @"", @"query": s[@"query"] ?: @"",
+              @"created_at": twitterDate(s[@"createdAt"]), @"position": NSNull.null };
+}
+static NSDictionary *savedSearchCreate(NSString *q) {
+    @synchronized (savedSearchLock()) {
+        NSString *sid = stableId(q);
+        NSMutableArray *all = [savedSearches() mutableCopy];
+        for (NSDictionary *s in all) if ([[s[@"id"] description] isEqual:sid]) return savedSearchJSON(s);
+        NSDictionary *s = @{ @"id": sid, @"query": q, @"createdAt": nowISO() };
+        [all addObject:s];
+        [NSUserDefaults.standardUserDefaults setObject:all forKey:kSavedSearchesKey];
+        return savedSearchJSON(s);
+    }
+}
+// Removes the saved search when `destroy`; returns it (nil if unknown).
+static NSDictionary *savedSearchFind(NSString *sid, BOOL destroy) {
+    @synchronized (savedSearchLock()) {
+        NSMutableArray *all = [savedSearches() mutableCopy];
+        for (NSUInteger i = 0; i < all.count; i++) {
+            if (![[all[i][@"id"] description] isEqual:sid]) continue;
+            NSDictionary *s = all[i];
+            if (destroy) { [all removeObjectAtIndex:i]; [NSUserDefaults.standardUserDefaults setObject:all forKey:kSavedSearchesKey]; }
+            return savedSearchJSON(s);
+        }
+        return nil;
+    }
+}
+
 #pragma mark - OAuth state
 
 static NSString *gLastOAuthUuid = nil; // echoed into the callback URL (see redirect.m)
@@ -1185,11 +1587,18 @@ NSString *bridge_oauth_callback_url(void) {
 // Prefers the readable handle; falls back to the DID (always valid) when no handle
 // is known, and to the profile page when the post isn't in the registry.
 NSString *bridge_post_web_url(NSString *statusId, NSString *handle) {
+    NSString *cardUrl = bridge_card_url(statusId);
+    if (cardUrl) return cardUrl;
     NSDictionary *ref = resolvePostRef(statusId);
     NSArray<NSString *> *parts = [ref[@"uri"] hasPrefix:@"at://"] ? [[ref[@"uri"] substringFromIndex:5] componentsSeparatedByString:@"/"] : nil;
     if (parts.count < 3) return handle.length ? bridge_profile_web_url(handle) : nil;
     NSString *actor = handle.length ? handle : parts[0];
     return [NSString stringWithFormat:@"https://bsky.app/profile/%@/post/%@", actor, parts[2]];
+}
+
+// The link behind a link card's synthetic status id (nil for anything else).
+NSString *bridge_card_url(NSString *statusId) {
+    return cardForId(statusId)[@"_card_url"];
 }
 
 NSString *bridge_profile_web_url(NSString *handle) {
@@ -1415,6 +1824,7 @@ static BridgeResp routeRequest(NSString *method, NSString *path, NSDictionary *q
         // any reply that isn't the post itself. Hand it the whole reply tree under the
         // post (its result set dedupes across the per-author calls). A plain profile
         // refresh's since_id is a real post id, so since_id + 1 never resolves for it.
+        if (cardForId(query[@"user_id"])) return jsonResp(@[]); // a link card's "author" has no posts
         NSString *openedId = [query[@"include_rts"] isEqual:@"0"] ? openedIdForSinceId(query[@"since_id"]) : nil;
         if (openedId) {
             if (query[@"max_id"]) return jsonResp(@[]); // everything came on the first page
@@ -1449,26 +1859,59 @@ static BridgeResp routeRequest(NSString *method, NSString *path, NSDictionary *q
         return jsonResp(statusesInRange(out, query));
     }
     // ---- search ----
-    // The detail view's reply lookup (_PTHTweetbotStatusReplySearchCursor):
-    // q="to:<author> AND filter:replies", since_id = <post id> - 1; it keeps results whose
-    // in_reply_to_status_id is the post. Other searches aren't backed yet: answer an
-    // empty, well-formed result.
     if ([path containsString:@"/search/tweets"]) {
         NSString *q = query[@"q"] ?: @"";
+        NSArray *statuses = nil; NSString *err = nil;
+        // The detail view's reply lookup (_PTHTweetbotStatusReplySearchCursor):
+        // q="to:<author> AND filter:replies", since_id = <post id> - 1; it keeps results
+        // whose in_reply_to_status_id is the post. Everything else is a real search.
         NSString *openedId = [q containsString:@"filter:replies"] ? openedIdForSinceId(query[@"since_id"]) : nil;
-        NSArray *statuses = @[];
-        if (openedId && !query[@"max_id"]) {
-            NSString *err = nil; statuses = threadReplyStatuses(openedId, YES, &err);
-            if (!statuses) return errResp(err);
-        }
+        if (openedId) statuses = query[@"max_id"] ? @[] : threadReplyStatuses(openedId, YES, &err);
+        else statuses = searchStatuses(q, query, &err);
+        if (!statuses) return errResp(err);
         return jsonResp(@{ @"statuses": statuses,
                            @"search_metadata": @{ @"count": @(statuses.count), @"query": q, @"since_id_str": query[@"since_id"] ?: @"0" } });
+    }
+    if ([path containsString:@"/users/search"]) {
+        NSString *err = nil; NSArray *users = searchUsers(query[@"q"] ?: @"", &err);
+        if (!users) return errResp(err);
+        return jsonResp(users);
+    }
+    // Trends: one worldwide place (Bluesky's trends aren't per-location).
+    if ([path containsString:@"/trends/available"] || [path containsString:@"/trends/closest"]) {
+        return jsonResp(@[@{ @"name": @"Worldwide", @"woeid": @1, @"parentid": @0, @"country": @"", @"countryCode": NSNull.null,
+                             @"url": @"http://where.yahooapis.com/v1/place/1", @"placeType": @{ @"code": @19, @"name": @"Supername" } }]);
+    }
+    if ([path containsString:@"/trends/place"]) {
+        NSString *err = nil; NSArray *trends = loadTrends(&err);
+        if (!trends) return errResp(err);
+        NSString *now = nowISO();
+        return jsonResp(@[@{ @"trends": trends, @"as_of": now, @"created_at": now,
+                             @"locations": @[@{ @"name": @"Worldwide", @"woeid": @1 }] }]);
+    }
+    // Saved searches (stored locally, see savedSearchCreate).
+    if ([path containsString:@"/saved_searches/"]) {
+        if ([path containsString:@"/saved_searches/list"]) {
+            NSMutableArray *out = [NSMutableArray array];
+            for (NSDictionary *s in savedSearches()) [out addObject:savedSearchJSON(s)];
+            return jsonResp(out);
+        }
+        if ([path containsString:@"/saved_searches/create"]) {
+            NSString *q = [query[@"query"] ?: @"" stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            if (!q.length) return errResp(@"missing query");
+            return jsonResp(savedSearchCreate(q));
+        }
+        NSString *sid = [path.lastPathComponent stringByDeletingPathExtension];
+        NSDictionary *s = savedSearchFind(sid, [path containsString:@"/saved_searches/destroy/"]);
+        return s ? jsonResp(s) : notFoundResp();
     }
     // ---- single statuses (detail view refresh, quoted/linked posts) ----
     // Tweetbot re-fetches a post when its detail view opens and MERGES the result, so an
     // empty {} here wiped media, quotes and counts. Ids are ones we handed out.
     if ([method isEqual:@"GET"] && [path containsString:@"/statuses/show"]) {
         NSString *sid = query[@"id"] ?: [path.lastPathComponent stringByDeletingPathExtension];
+        NSDictionary *card = cardForId(sid); // link cards aren't posts: echo what we served
+        if (card) return jsonResp(card);
         NSDictionary *ref = resolvePostRef(sid);
         if (!ref) return notFoundResp();
         NSString *err = nil; NSDictionary *post = atpGetPost(ref[@"uri"], &err);
@@ -1481,10 +1924,21 @@ static BridgeResp routeRequest(NSString *method, NSString *path, NSDictionary *q
         for (NSString *sid in ids) { NSDictionary *ref = resolvePostRef(sid); if (ref[@"uri"] && ![uris containsObject:ref[@"uri"]]) [uris addObject:ref[@"uri"]]; }
         NSDictionary *hydrated = atpGetPostsMap(uris);
         NSMutableArray *out = [NSMutableArray array];
+        NSMutableDictionary *byId = [NSMutableDictionary dictionary];
         for (NSString *sid in ids) {
-            NSDictionary *ref = resolvePostRef(sid); NSDictionary *post = ref[@"uri"] ? hydrated[ref[@"uri"]] : nil;
-            if (post) [out addObject:statusFromFeedItem(ref[@"reason"] ? @{ @"post": post, @"reason": ref[@"reason"], @"_id": sid } : @{ @"post": post, @"_id": sid })];
+            if (!sid.length) continue;
+            NSDictionary *s = cardForId(sid);
+            if (!s) {
+                NSDictionary *ref = resolvePostRef(sid); NSDictionary *post = ref[@"uri"] ? hydrated[ref[@"uri"]] : nil;
+                if (post) s = statusFromFeedItem(ref[@"reason"] ? @{ @"post": post, @"reason": ref[@"reason"], @"_id": sid } : @{ @"post": post, @"_id": sid });
+            }
+            if (s) [out addObject:s];
+            byId[sid] = s ?: NSNull.null;
         }
+        // +[PTHTweetbotStatus lookup:result:] (which every search result goes through)
+        // sends map=true and reads only Twitter's map shape, { id: { <id>: status | null } };
+        // given an array it "fails to find" them all and the search shows nothing.
+        if ([query[@"map"] isEqual:@"true"]) return jsonResp(@{ @"id": byId });
         return jsonResp(out);
     }
 
@@ -1524,6 +1978,8 @@ static BridgeResp routeRequest(NSString *method, NSString *path, NSDictionary *q
 
     // ---- user lookup ----
     if ([path containsString:@"/users/show"]) {
+        NSDictionary *card = cardForId(query[@"user_id"]);
+        if (card) return jsonResp(card[@"user"]);
         NSString *actor = resolveActor(query[@"screen_name"] ?: query[@"user_id"], gDID);
         NSString *err = nil; id me = atpView(@"app.bsky.actor.getProfile", @{ @"actor": actor ?: @"" }, &err);
         if (!me) return errResp(err);

@@ -17,3 +17,7 @@ NSString *bridge_oauth_callback_url(void);
 // bridge_post_web_url falls back to the author's profile URL on a registry miss.
 NSString *bridge_profile_web_url(NSString *handle);
 NSString *bridge_post_web_url(NSString *statusId, NSString *handle);
+
+// The external link behind a link card (an app.bsky.embed.external served as a synthetic
+// quoted status), by that status' id. nil when the id isn't a card.
+NSString *bridge_card_url(NSString *statusId);

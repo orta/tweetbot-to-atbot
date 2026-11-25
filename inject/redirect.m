@@ -264,6 +264,45 @@ static void hookInstance(Class cls, SEL sel, IMP repl, IMP *outOrig) {
     *outOrig = method_setImplementation(m, repl);
 }
 
+
+// ---- Link cards --------------------------------------------------------------
+// The bridge serves a post's link card (app.bsky.embed.external) as a synthetic quoted
+// status, since the quote box is the only boxed sub-view Tweetbot has. Clicking a real
+// quote opens that status; clicking a card should open the link. Both the timeline row
+// (PTHTweetbotStatusView) and the detail header (PTHTweetbotStatusDetailStatusView)
+// route the click through -_quoteClicked:.
+static IMP orig_rowQuoteClicked;
+static IMP orig_detailQuoteClicked;
+
+static BOOL openLinkCard(id view) {
+    @try {
+        SEL statusSel = sel_registerName("status"), quoteSel = sel_registerName("quotedStatus"),
+            tidSel = sel_registerName("originalTIDValue");
+        id st = [view respondsToSelector:statusSel] ? ((id(*)(id, SEL))objc_msgSend)(view, statusSel) : nil;
+        id q = [st respondsToSelector:quoteSel] ? ((id(*)(id, SEL))objc_msgSend)(st, quoteSel) : nil;
+        NSNumber *tid = [q respondsToSelector:tidSel] ? ((id(*)(id, SEL))objc_msgSend)(q, tidSel) : nil;
+        NSString *s = tid ? bridge_card_url(tid.stringValue) : nil;
+        NSURL *u = s ? [NSURL URLWithString:s] : nil;
+        if (!u) return NO;
+        id ws = ((id(*)(id, SEL))objc_msgSend)((id)objc_getClass("NSWorkspace"), sel_registerName("sharedWorkspace"));
+        ((BOOL(*)(id, SEL, id))objc_msgSend)(ws, sel_registerName("openURL:"), u);
+        return YES;
+    } @catch (__unused id e) {}
+    return NO;
+}
+static void my_rowQuoteClicked(id self, SEL _cmd, id sender) {
+    if (!openLinkCard(self)) ((void(*)(id, SEL, id))orig_rowQuoteClicked)(self, _cmd, sender);
+}
+static void my_detailQuoteClicked(id self, SEL _cmd, id sender) {
+    if (!openLinkCard(self)) ((void(*)(id, SEL, id))orig_detailQuoteClicked)(self, _cmd, sender);
+}
+static void installLinkCardHooks(void) {
+    Class row = objc_getClass("PTHTweetbotStatusView"), detail = objc_getClass("PTHTweetbotStatusDetailStatusView");
+    if (row) hookInstance(row, sel_registerName("_quoteClicked:"), (IMP)my_rowQuoteClicked, &orig_rowQuoteClicked);
+    if (detail) hookInstance(detail, sel_registerName("_quoteClicked:"), (IMP)my_detailQuoteClicked, &orig_detailQuoteClicked);
+    tblog(@"link card hooks: row=%d detail=%d", orig_rowQuoteClicked != NULL, orig_detailQuoteClicked != NULL);
+}
+
 __attribute__((constructor))
 static void tweetbot_atproto_init(void) {
     @autoreleasepool {
@@ -310,6 +349,7 @@ static void tweetbot_atproto_init(void) {
         installOAuthProbe();
         neutralizeCloudKit();
         installWebURLHooks();
+        installLinkCardHooks();
 
         tblog(@"redirector installed (NSURLSession + openURL hooks), bridge port %d", kBridgePort);
     }

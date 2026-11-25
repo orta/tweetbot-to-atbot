@@ -164,6 +164,17 @@ avoid it. Timeline window: File → New Window. A persisted account auto-reautho
   `video_info.variants: [{content_type: "application/x-mpegURL", url: playlist}]` and the
   thumbnail as `media_url_https`. `mediumWithEntity:` takes the first HLS variant (for `video`
   under 4s it hunts for a `video/mp4` by bitrate, falling back to HLS), and AVPlayer streams it.
+- **Link cards (OpenGraph)**: Tweetbot has no link-preview view (`PTHTweetbotCard` only scrapes
+  media), so an `app.bsky.embed.external` is served as a synthetic `quoted_status` (`cardStatus`):
+  title = user `name` (the bold line), host = `screen_name`, description + link = text, thumb = a
+  photo. A real quote wins the box (one per status); with a card the trailing link is no longer
+  appended to the post text. Gotchas: Tweetbot **dedupes users by screen name**, so the host gets
+  an invisible zero-width suffix unique per card (else cards from one site share a title and a
+  host that is a real handle merges with that account); the quote box **prints a media entity's
+  `display_url` even outside `display_text_range`** (real quotes with photos show `pic.bsky.app/…`
+  too), so the card's link text is itself the media entity. Card ids live in a card registry
+  (`statuses/show`, `users/show`, permalinks). `redirect.m` hooks `-_quoteClicked:` on
+  `PTHTweetbotStatusView` / `PTHTweetbotStatusDetailStatusView` so clicking a card opens the link.
 - **Detail view re-fetch**: opening a post calls `statuses/show/<id>.json` and Tweetbot
   **merges** the response into its cached status — an empty `{}` wipes media, quote and
   counts. Ids resolve through the post registry (repost wrapper ids too, carrying the reason).
@@ -179,6 +190,22 @@ avoid it. Timeline window: File → New Window. A persisted account auto-reautho
   (never the `_str` forms), so every reply must carry them. Replies are sorted by numeric
   TID (`-[PTHTweetbotObject compare:]`). `to:(null)` in the query means the detail re-fetch
   wiped the author (an empty `statuses/show` answer makes `userWithDictionary:nil`).
+- **Search** (`PTHTweetbotStatusSearchCursor`, TID pager): `search/tweets.json` with q = typed
+  text + space + `-filter:retweets`, `result_type=recent&count=100`. Served by `searchPosts sort=latest`
+  through `pagedFeed`. Bluesky's query has `from: to: mentions: since: until: lang: domain: #tag`
+  but no `filter:`/`min_*` and **no OR** (`a OR b` returns 0 hits), so those Twitter operators
+  become tests on the results (`blueskySearchQuery`). **Every result goes through
+  `+[PTHTweetbotStatus lookup:result:]`**: a POST to `statuses/lookup.json` with `map=true` that
+  only accepts `{id: {<id>: status|null}}`. An array answer makes it drop everything and page
+  older forever ("No Results"). Mentions' `_loadQuotesSinceTID:` searches
+  `<bsky.app post link> OR …` for quotes of your posts → `getQuotes` (wants the DID at-uri; a
+  handle at-uri returns nothing). `users/search` (`PTHTweetbotUserSearchCursor`): only `q`, one
+  page, no paging → `searchActors` hydrated with `getProfiles` for counts. Trends:
+  `trends/place.json` → `[{trends: [{name, query (Tweetbot urlDecodes it), tweet_volume}]}]` from
+  `getTrends`. Each trend is a feed generator (`link` `/profile/<did>/feed/<rkey>`), so a search
+  for a trend's name is answered from that feed (rank ids). Bluesky has no server-side saved
+  searches: they live in the app's defaults (`atbotSavedSearches`; prototype:
+  `bridge/.saved-searches.json`).
 - **Feeds = Twitter lists**: Tweetbot's timeline-title dropdown is filled from `lists/list.json`.
   We answer it with the user's saved feeds (`getPreferences` → `savedFeedsPrefV2`, pinned first,
   skipping the `timeline`/following entry; hydrated via `getFeedGenerators` / `getList`), and
@@ -252,6 +279,8 @@ avoid it. Timeline window: File → New Window. A persisted account auto-reautho
   for write-backs; registries `resolvePostRef`/`resolveActor` map numeric ids back). Optimistic
   like/repost echoes; a just-posted skeet is synthesized locally (AppView indexing lags a
   re-fetch). **Web permalinks** (bsky.app) for Copy Link / Open in Browser.
+- **Search**: posts (with Twitter operators), people, trends (served from their trending
+  feeds), saved searches (local), and quote-posts of yours mixed into Mentions.
 - **Dependency-free injection**: PTHCommon has ~5 KB header padding (the main binary has 16
   bytes), so `inject-framework.mjs` adds the `LC_LOAD_DYLIB` in place — no LIEF, no relocation.
   `DYLD_INSERT_LIBRARIES` is out (the sandboxed/signed binary is "restricted", dyld strips it).
@@ -263,7 +292,8 @@ avoid it. Timeline window: File → New Window. A persisted account auto-reautho
 
 ## Still TODO
 
-- DMs, search result quality, media upload, richer notifications.
+- DMs, media upload, richer notifications. Search: `OR` queries (Bluesky can't), and the UI
+  still says "Search Twitter".
 - **Sync the Node prototype**: lists + web-permalink helpers were added to `bridge.m` only; the
   `bridge/*.mjs` prototype lacks them. Mirror if you iterate there.
 

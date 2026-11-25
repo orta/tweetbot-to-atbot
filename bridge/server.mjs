@@ -9,7 +9,9 @@
 //   BRIDGE_PDS           default https://bsky.social
 import http from "node:http";
 import { AtpClient } from "./atproto.mjs";
-import { userFromProfile, statusFromFeedItem, stableId, resolveActor, resolvePostRef, buildFacets, twitterList, findList, listViewName, numId, snowflakeId, keyHash, tidMs, isoMs } from "./shapes.mjs";
+import { userFromProfile, statusFromFeedItem, stableId, resolveActor, resolvePostRef, cardForId, buildFacets, twitterList, findList, listViewName, numId, snowflakeId, keyHash, tidMs, isoMs } from "./shapes.mjs";
+import fs from "node:fs";
+import { quotedPost, TWITTER_DATE } from "./shapes.mjs";
 
 const PORT = Number(process.env.BRIDGE_PORT || 8080);
 const atp = new AtpClient({ pds: process.env.BRIDGE_PDS || "https://bsky.social" });
@@ -197,6 +199,7 @@ const routes = [
     // any reply that isn't the post itself. Hand it the whole reply tree under the
     // post (its result set dedupes across the per-author calls). A plain profile
     // refresh's since_id is a real post id, so since_id + 1 never resolves for it.
+    if (cardForId(q.user_id)) return []; // a link card's "author" has no posts
     const openedId = q.include_rts === "0" ? openedIdForSinceId(q.since_id) : null;
     if (openedId) return q.max_id ? [] : threadReplyStatuses(openedId, false);
     const actor = resolveActor(q.screen_name || q.user_id, atp.session.did);
@@ -213,30 +216,56 @@ const routes = [
 
   // --- search. The detail view's reply lookup (_PTHTweetbotStatusReplySearchCursor):
   // q="to:<author> AND filter:replies", since_id = <post id> - 1; it keeps results whose
-  // in_reply_to_status_id is the post. Other searches aren't backed yet: answer an
-  // empty, well-formed result.
+  // in_reply_to_status_id is the post. Everything else is a real search (searchStatuses).
   ["GET", /\/1\.1\/search\/tweets\.json/, async (q) => {
     const openedId = String(q.q || "").includes("filter:replies") ? openedIdForSinceId(q.since_id) : null;
-    const statuses = openedId && !q.max_id ? await threadReplyStatuses(openedId, true) : [];
+    const statuses = openedId ? (q.max_id ? [] : await threadReplyStatuses(openedId, true)) : await searchStatuses(q);
     return { statuses, search_metadata: { count: statuses.length, query: q.q || "", since_id_str: q.since_id || "0" } };
   }],
+  ["GET", /\/1\.1\/users\/search\.json/, (q) => searchUsers(q.q)],
+  // Trends: one worldwide place (Bluesky's trends aren't per-location).
+  ["GET", /\/1\.1\/trends\/(available|closest)\.json/, () => [{
+    name: "Worldwide", woeid: 1, parentid: 0, country: "", countryCode: null,
+    url: "http://where.yahooapis.com/v1/place/1", placeType: { code: 19, name: "Supername" },
+  }]],
+  ["GET", /\/1\.1\/trends\/place\.json/, async () => {
+    const trends = await loadTrends();
+    const now = new Date().toISOString();
+    return [{ trends, as_of: now, created_at: now, locations: [{ name: "Worldwide", woeid: 1 }] }];
+  }],
+  // Saved searches (stored locally, see savedSearchCreate).
+  ["GET", /\/1\.1\/saved_searches\/list\.json/, () => readSavedSearches().map(savedSearchJSON)],
+  ["POST", /\/1\.1\/saved_searches\/create\.json/, (q, req) => {
+    const query = String(mergedParams(q, req).query || "").trim();
+    if (!query) throw new Error("missing query");
+    return savedSearchCreate(query);
+  }],
+  ["GET", /\/1\.1\/saved_searches\/show\/(\d+)\.json/, (q, req, m) => savedSearchFind(m[1], false) || notFound()],
+  ["POST", /\/1\.1\/saved_searches\/destroy\/(\d+)\.json/, (q, req, m) => savedSearchFind(m[1], true) || notFound()],
 
   // --- single statuses (detail-view refresh, quoted/linked posts). Tweetbot MERGES
   // the result into its cached status, so an empty {} wiped media/quotes/counts.
   ["GET", /\/1\.1\/statuses\/show(?:\/(\d+))?\.json/, async (q, req, m) => {
     const sid = String(q.id || m[1] || "");
+    if (cardForId(sid)) return cardForId(sid); // link cards aren't posts: echo what we served
     const ref = resolvePostRef(sid);
     const post = ref && (await atp.getPost(ref.uri));
     if (!post) return notFound();
     return statusFromFeedItem({ post, ...(ref.reason ? { reason: ref.reason } : {}), _id: sid });
   }],
-  ["GET", /\/1\.1\/statuses\/lookup\.json/, async (q) => {
-    const ids = String(q.id || "").split(",");
+  // +[PTHTweetbotStatus lookup:result:] (which every search result goes through) POSTs
+  // this with map=true and reads only Twitter's map shape, { id: { <id>: status | null } };
+  // given an array it "fails to find" them all and the search shows nothing.
+  ...["GET", "POST"].map((method) => [method, /\/1\.1\/statuses\/lookup\.json/, async (q, req) => {
+    const p = mergedParams(q, req);
+    const ids = String(p.id || "").split(",").filter(Boolean);
     const refs = ids.map(resolvePostRef);
     const hydrated = await atp.getPostsMap([...new Set(refs.filter(Boolean).map((r) => r.uri))]);
-    return ids.map((sid, i) => [sid, refs[i]]).filter(([, r]) => r && hydrated.has(r.uri))
-      .map(([sid, r]) => statusFromFeedItem({ post: hydrated.get(r.uri), ...(r.reason ? { reason: r.reason } : {}), _id: sid }));
-  }],
+    const found = ids.map((sid, i) => [sid, cardForId(sid) || (refs[i] && hydrated.has(refs[i].uri)
+      ? statusFromFeedItem({ post: hydrated.get(refs[i].uri), ...(refs[i].reason ? { reason: refs[i].reason } : {}), _id: sid }) : null)]);
+    if (p.map === "true") return { id: Object.fromEntries(found) };
+    return found.map(([, s]) => s).filter(Boolean);
+  }]),
 
   // --- lists = Bluesky saved feeds + lists (Tweetbot's timeline title dropdown) ---
   ["GET", /\/1\.1\/lists\/list\.json/, (q) => loadLists(q.user_id)],
@@ -261,6 +290,7 @@ const routes = [
 
   // --- user lookup ---
   ["GET", /\/1\.1\/users\/show\.json/, async (q) => {
+    if (cardForId(q.user_id)) return cardForId(q.user_id).user;
     const actor = resolveActor(q.screen_name || q.user_id, atp.session.did);
     const me = await atp.view("app.bsky.actor.getProfile", { params: { actor } });
     return userFromProfile(me);
@@ -362,6 +392,203 @@ async function threadReplyStatuses(openedId, directOnly) {
     const s = statusFromFeedItem({ post: r.post });
     return r.depth === 1 ? { ...s, in_reply_to_status_id: numId(openedId), in_reply_to_status_id_str: openedId } : s;
   });
+}
+
+// ---- search (search/tweets, users/search, trends, saved searches) ----
+// Tweetbot's search (PTHTweetbotStatusSearchCursor) sends q = "<what you typed>
+// -filter:retweets" with result_type=recent&count=100 and pages it by id like any
+// timeline (PTHTweetbotTIDCursorPager). app.bsky.feed.searchPosts speaks most of the same
+// operators (from: to: mentions: since: until: lang: domain: #tag "phrase") but none of
+// Twitter's filter:/min_* ones and no OR, so those come out of the query and run as tests
+// on the results instead.
+
+// The post's embed (or, for a quote with media, its media part) has view type `type`.
+const postHasEmbed = (p, type) => p?.embed?.$type === type || p?.embed?.media?.$type === type;
+const postHasLink = (p) => postHasEmbed(p, "app.bsky.embed.external#view") ||
+  (p?.record?.facets || []).some((f) => (f?.features || []).some((x) => x?.$type === "app.bsky.richtext.facet#link"));
+const hasImages = (p) => postHasEmbed(p, "app.bsky.embed.images#view");
+const hasVideo = (p) => postHasEmbed(p, "app.bsky.embed.video#view");
+// Twitter `filter:<name>` -> a test on a post view.
+const SEARCH_FILTERS = new Map([
+  ["replies", (p) => !!p?.record?.reply],
+  ["images", hasImages], ["twimg", hasImages],
+  ["videos", hasVideo], ["native_video", hasVideo],
+  ["media", (p) => hasImages(p) || hasVideo(p)],
+  ["links", postHasLink],
+  ["quote", (p) => !!quotedPost(p?.embed)],
+]);
+const COUNT_OPS = new Map([["min_faves", "likeCount"], ["min_retweets", "repostCount"], ["min_replies", "replyCount"]]);
+
+// Twitter search query -> { bq: searchPosts q, tests: [post => bool] for what Bluesky lacks }.
+function blueskySearchQuery(q) {
+  const terms = [], tests = [];
+  for (const tok of String(q).match(/-?"[^"]*"|\S+/g) || []) {
+    if (tok === "AND") continue; // implicit in both
+    const neg = tok.length > 1 && tok.startsWith("-");
+    const body = neg ? tok.slice(1) : tok;
+    const i = body.indexOf(":");
+    const op = i >= 0 ? body.slice(0, i).toLowerCase() : null, arg = i >= 0 ? body.slice(i + 1) : "";
+    if (op === "filter" || op === "exclude" || op === "include") {
+      // Search never returns reposts (so -filter:retweets, which Tweetbot always
+      // appends, holds anyway); unsupported filters are dropped, not searched for.
+      const t = /retweets$/i.test(arg) || op === "include" ? null : SEARCH_FILTERS.get(arg.toLowerCase());
+      if (t) tests.push(neg || op === "exclude" ? (p) => !t(p) : t);
+      continue;
+    }
+    if (COUNT_OPS.has(op)) {
+      const key = COUNT_OPS.get(op), n = parseInt(arg, 10) || 0;
+      tests.push((p) => ((p?.[key] || 0) >= n) !== neg);
+      continue;
+    }
+    if (op === "url" && arg) { terms.push(`${neg ? "-" : ""}domain:${arg.split("/")[0]}`); continue; } // Bluesky has domain:
+    terms.push(tok);
+  }
+  return { bq: terms.join(" "), tests };
+}
+
+// A fetchPage over searchPosts (posts -> feed items) keeping only posts that pass
+// `tests`. pagedFeed stops at an empty page, so a page the tests empty out moves on.
+const searchFetch = (bq, sort, limit, tests) => async (cursor) => {
+  for (let page = 0; ; page++) {
+    const r = await atp.view("app.bsky.feed.searchPosts", { params: { q: bq, sort, limit, ...(cursor ? { cursor } : {}) } });
+    const posts = r.posts || [];
+    const feed = posts.filter((p) => tests.every((t) => t(p))).map((post) => ({ post }));
+    if (feed.length || !r.cursor || !posts.length || page === 2) return { feed, cursor: r.cursor || null };
+    cursor = r.cursor;
+  }
+};
+
+// Handle (or DID) -> DID: the actor registry first, else the public resolver.
+async function handleToDid(h) {
+  if (!h) return null;
+  if (h.startsWith("did:")) return h;
+  const known = resolveActor(h, null);
+  return known?.startsWith("did:") ? known : atp.resolveHandleToDid(h);
+}
+
+// Mentions mixes in quotes of your posts (-[PTHTweetbotCurrentUserMentionsCursor
+// _loadQuotesSinceTID:maxTID:block:]): it ORs the links of your recent posts (their
+// twitterURL, which redirect.m points at bsky.app) into one search and keeps results that
+// quote you. Bluesky answers that directly: app.bsky.feed.getQuotes. A query that is
+// nothing but bsky.app post links -> their at:// uris (getQuotes wants the DID form);
+// null for any other query.
+const BSKY_POST_LINK = /^https?:\/\/(?:www\.)?bsky\.app\/profile\/([^/\s]+)\/post\/([^/\s?#]+)\/?$/i;
+async function quotedPostUris(bq) {
+  const links = [];
+  for (const tok of bq.split(/\s+/)) {
+    if (!tok || tok === "OR") continue;
+    const m = BSKY_POST_LINK.exec(tok);
+    if (!m) return null;
+    links.push([m[1], m[2]]);
+  }
+  if (!links.length) return null;
+  const uris = [];
+  for (const [actor, rkey] of links) {
+    const did = await handleToDid(actor);
+    if (did) uris.push(`at://${did}/app.bsky.feed.post/${rkey}`);
+  }
+  return uris;
+}
+async function quoteStatuses(uris, q) {
+  const seen = new Set(), out = [];
+  for (const uri of uris) {
+    const r = await atp.view("app.bsky.feed.getQuotes", { params: { uri, limit: 50 } }).catch(() => null);
+    for (const post of r?.posts || []) {
+      if (!post?.uri || seen.has(post.uri)) continue;
+      seen.add(post.uri);
+      out.push(statusFromFeedItem({ post }));
+    }
+  }
+  return statusesInRange(out, q);
+}
+
+// Trends (the search view's trend list) = Bluesky's trending topics. Each is backed by a
+// feed (link "/profile/<did>/feed/<rkey>"), and opening a trend searches its `query`
+// (Tweetbot urlDecodes it), so the trend's name maps back to that feed here and the
+// search is answered from the feed instead of a text search for the headline.
+const trendFeeds = new Map(); // normalized name -> feed uri
+const trendKey = (s) => String(s).toLowerCase().split(/\s+/).filter(Boolean).join(" ");
+// "/profile/<actor>/feed/<rkey>" -> at://<did>/app.bsky.feed.generator/<rkey>
+async function feedUriFromLink(link) {
+  const parts = String(link).split("/");
+  if (parts.length !== 5 || parts[1] !== "profile" || parts[3] !== "feed" || !parts[4]) return null;
+  const did = await handleToDid(parts[2]);
+  return did ? `at://${did}/app.bsky.feed.generator/${parts[4]}` : null;
+}
+async function loadTrends() {
+  let items = (await atp.view("app.bsky.unspecced.getTrends", { params: { limit: 25 } }).catch(() => null))?.trends;
+  // AppViews without getTrends: topics only (no post counts)
+  if (!Array.isArray(items)) items = (await atp.view("app.bsky.unspecced.getTrendingTopics", { params: { limit: 25 } })).topics || [];
+  const trends = [];
+  for (const t of items) {
+    const name = String(t?.displayName || "").trim() || String(t?.topic || "").trim();
+    if (!name) continue;
+    const link = typeof t.link === "string" ? t.link : "";
+    let searchQ = name;
+    const feed = await feedUriFromLink(link);
+    if (feed) trendFeeds.set(trendKey(name), feed);
+    else if (link.startsWith("/search?q=")) { try { searchQ = decodeURIComponent(link.slice(10)); } catch {} }
+    trends.push({
+      name, query: encodeURIComponent(searchQ), url: `https://bsky.app${link}`,
+      tweet_volume: typeof t.postCount === "number" ? t.postCount : null, promoted_content: null,
+    });
+  }
+  return trends;
+}
+
+// search/tweets for anything but the reply lookup.
+async function searchStatuses(q) {
+  const { bq, tests } = blueskySearchQuery(q.q || "");
+  if (!bq) return []; // nothing left to search for (searchPosts needs a q)
+  const quoted = await quotedPostUris(bq);
+  if (quoted) return quoteStatuses(quoted, q);
+  const limit = clampCount(q.count);
+  const trendFeed = trendFeeds.get(trendKey(bq));
+  if (trendFeed) return pagedFeed(trendFeed, q, true, viewFetch("app.bsky.feed.getFeed", { feed: trendFeed, limit }));
+  // "popular" is ranked: rank ids keep searchPosts' order through Tweetbot's id sort.
+  const sort = q.result_type === "popular" ? "top" : "latest";
+  return pagedFeed(`search:${sort}:${q.q || ""}`, q, sort === "top", searchFetch(bq, sort, limit, tests));
+}
+
+// users/search (PTHTweetbotUserSearchCursor): only `q`, one page, no paging.
+// searchActors returns basic profiles without counts, so hydrate via getProfiles.
+async function searchUsers(raw) {
+  const q = String(raw || "").trim().replace(/^@/, "");
+  if (!q) return [];
+  const r = await atp.view("app.bsky.actor.searchActors", { params: { q, limit: 50 } });
+  const actors = (r.actors || []).filter((a) => a?.did);
+  const full = new Map();
+  for (let i = 0; i < actors.length; i += 25) {
+    const pr = await atp.view("app.bsky.actor.getProfiles", { params: { actors: actors.slice(i, i + 25).map((a) => a.did) } }).catch(() => null);
+    for (const p of pr?.profiles || []) if (p?.did) full.set(p.did, p);
+  }
+  return actors.map((a) => userFromProfile(full.get(a.did) || a));
+}
+
+// Saved searches: Bluesky keeps none server-side, so they live locally (the app uses its
+// own defaults; the prototype a gitignored JSON file next to this one). Stored as
+// { id, query, createdAt }; id = stableId(query), so saving twice is a no-op.
+const SAVED_SEARCHES = new URL("./.saved-searches.json", import.meta.url);
+function readSavedSearches() {
+  try { const a = JSON.parse(fs.readFileSync(SAVED_SEARCHES, "utf8")); return Array.isArray(a) ? a : []; } catch { return []; }
+}
+const writeSavedSearches = (all) => fs.writeFileSync(SAVED_SEARCHES, JSON.stringify(all, null, 2));
+const savedSearchJSON = (s) => ({
+  id: Number(s.id), id_str: String(s.id), name: s.query, query: s.query, created_at: TWITTER_DATE(s.createdAt), position: null,
+});
+function savedSearchCreate(query) {
+  const all = readSavedSearches(), id = stableId(query);
+  let s = all.find((x) => String(x.id) === id);
+  if (!s) { s = { id, query, createdAt: new Date().toISOString() }; all.push(s); writeSavedSearches(all); }
+  return savedSearchJSON(s);
+}
+// Removes the saved search when `destroy`; returns it (null if unknown).
+function savedSearchFind(id, destroy) {
+  const all = readSavedSearches(), i = all.findIndex((x) => String(x.id) === String(id));
+  if (i < 0) return null;
+  const s = all[i];
+  if (destroy) { all.splice(i, 1); writeSavedSearches(all); }
+  return savedSearchJSON(s);
 }
 
 // ---- paging (since_id / max_id over atproto cursors) ----

@@ -13,6 +13,9 @@ node_modules/
 **/atproto.json
 *.app/Contents/Resources/atproto.json
 
+# Node prototype's local saved searches (bridge/server.mjs)
+bridge/.saved-searches.json
+
 # macOS
 .DS_Store
 
