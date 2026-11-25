@@ -25,7 +25,7 @@ GitHub Release is created.
 | Secret | What it is |
 | --- | --- |
 | `APPLE_CERTIFICATE` | base64 of a `.p12` holding the **Developer ID Application** certificate and its private key |
-| `APPLE_CERTIFICATE_PASSWORD` | the password set when exporting that `.p12` |
+| `APPLE_CERTIFICATE_PASSWORD` | the password set when exporting that `.p12`; leave unset if it has none |
 | `APPLE_API_KEY_P8` | the App Store Connect API key (`AuthKey_XXXXXXXXXX.p8`), as its PEM text |
 | `APPLE_API_KEY_ID` | that key's ID (the `XXXXXXXXXX` in the filename) |
 | `APPLE_API_ISSUER` | the issuer UUID shown above the keys list |

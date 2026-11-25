@@ -88,7 +88,9 @@ function setSecret(name, value) {
   if (r.status !== 0) die(`failed to set ${name}`);
 }
 setSecret("APPLE_CERTIFICATE", readFileSync(p12).toString("base64"));
-setSecret("APPLE_CERTIFICATE_PASSWORD", password);
+// GitHub can't store an empty secret; the workflow treats an unset one as "no password".
+if (password) setSecret("APPLE_CERTIFICATE_PASSWORD", password);
+else spawnSync("gh", ["secret", "delete", "APPLE_CERTIFICATE_PASSWORD", "-R", repo], { stdio: "ignore" });
 setSecret("APPLE_API_KEY_P8", p8Text);
 setSecret("APPLE_API_KEY_ID", keyId);
 setSecret("APPLE_API_ISSUER", issuer);

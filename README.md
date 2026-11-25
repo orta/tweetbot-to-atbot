@@ -14,6 +14,23 @@ Turns out, you can! So, I've cleaned it up a bunch and have given it a few hours
 This repo contains a macOS app, for modding an existing copy of Tweetbot which you should be
 able to install from the Mac App Store.
 
+## Install
+
+You need a Mac running macOS 11 or later, and a Bluesky account.
+
+1. **Install Tweetbot 3** from the Mac App Store, so it's at `/Applications/Tweetbot.app`.
+   It's no longer on sale, so look in the App Store under your account → Purchased.
+2. **Download `Atbotify-<version>.zip`** from the
+   [latest release](https://github.com/orta/tweetbot-to-atbot/releases/latest), unzip it
+   and open **Atbotify**.
+3. **Make an app password** at bsky.app → Settings → Privacy and Security → App Passwords.
+   Don't use your main password.
+4. **Enter your handle and the app password**, then click **Create atbot…** and choose
+   where to save it.
+
+atbot opens with your Bluesky timeline. Your original Tweetbot is left untouched; atbot is
+a separate copy. To switch feeds, click the **Timeline** title at the top of the window.
+
 ------
 
 **atbot** turns a copy of the discontinued Mac App Store app **Tweetbot 3.5.8** into a
