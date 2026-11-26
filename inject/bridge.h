@@ -18,6 +18,12 @@ NSString *bridge_oauth_callback_url(void);
 NSString *bridge_profile_web_url(NSString *handle);
 NSString *bridge_post_web_url(NSString *statusId, NSString *handle);
 
+// The user read a DM thread up to `lastReadTID` (a message event id the bridge handed out):
+// tell Bluesky (chat.bsky.convo.updateRead). Called from redirect.m's hook on
+// -[PTHTweetbotDirectMessageThread setLastReadTID:]. Returns at once; no-op for an id the
+// in-process bridge didn't serve (e.g. with an external TWEETBOT_BRIDGE_PORT bridge).
+void bridge_dm_mark_read(long long otherUserTID, long long lastReadTID);
+
 // The external link behind a link card (an app.bsky.embed.external served as a synthetic
 // quoted status), by that status' id. nil when the id isn't a card.
 NSString *bridge_card_url(NSString *statusId);

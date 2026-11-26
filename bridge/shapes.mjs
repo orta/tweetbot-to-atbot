@@ -152,7 +152,7 @@ export function userFromProfile(p) {
     id_str: id,
     id: Number(id),
     screen_name: p.handle,
-    name: p.displayName || p.handle,
+    name: String(p.displayName || "").trim() ? p.displayName : p.handle, // many profiles have displayName ""
     description: p.description || "",
     location: "",
     url: null,
@@ -421,6 +421,45 @@ function fitSize(w, h, box, resize) {
 
 // Pretty display form of a URL: drop scheme + "www.", trim trailing slash, and
 // elide very long paths the way Twitter/Tweetbot shows them.
+// ---- direct messages (chat.bsky.convo) -> Twitter message_create events ----
+// Event ids are snowflakes from the message's TID, like post ids (see inject/bridge.m).
+const dmMessageMs = (msg) => tidMs(msg?.id) || isoMs(msg?.sentAt);
+export function dmEventId(convoId, msg) {
+  const key = `${convoId || ""}/${msg?.id || ""}`;
+  const ms = dmMessageMs(msg);
+  return ms ? snowflakeId(ms, keyHash(key)).toString() : stableId(key);
+}
+export const dmOtherDid = (convo, selfDid) => (convo?.members || []).map((m) => m?.did).find((d) => d && d !== selfDid) || null;
+
+// One chat message as a Twitter message_create event. A shared post (app.bsky.embed.record)
+// is linked like a shared tweet: the twitter.com permalink opens it inside Tweetbot.
+export function dmEvent(convo, msg, selfDid) {
+  const sender = msg?.sender?.did || "";
+  const r = renderPost(msg || {}, {}, false);
+  let text = r.full_text;
+  const entities = { ...r.entities, urls: [...r.entities.urls] };
+  const q = quotedPost(msg?.embed);
+  if (q?.uri?.startsWith("at://")) {
+    const qs = statusFromPost(q, false);
+    const handle = qs.user?.screen_name;
+    const [repo, , rkey] = q.uri.slice(5).split("/");
+    const permalink = `https://twitter.com/${handle || "i"}/status/${qs.id_str}`;
+    if (text) text += " ";
+    const start = cpLen(text);
+    text += permalink;
+    entities.urls.push({ url: permalink, expanded_url: permalink, display_url: prettyUrl(`https://bsky.app/profile/${handle || repo}/post/${rkey}`), indices: [start, cpLen(text)] });
+  }
+  return {
+    type: "message_create", id: dmEventId(convo?.id, msg),
+    created_timestamp: String(dmMessageMs(msg) || Date.now()),
+    message_create: {
+      target: { recipient_id: sender === selfDid ? stableId(dmOtherDid(convo, selfDid) || "") : stableId(selfDid || "") },
+      sender_id: stableId(sender),
+      message_data: { text, entities },
+    },
+  };
+}
+
 function prettyUrl(uri) {
   let s = String(uri).replace(/^https?:\/\//i, "").replace(/^www\./i, "").replace(/\/$/, "");
   if (s.length > 30) s = s.slice(0, 27) + "…";

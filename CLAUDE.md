@@ -90,6 +90,14 @@ delivery. (For a from-scratch manual drive you can still `open -b io.orta.atbot
 Reopen"` (curly apostrophe) and is a self-inflicted artifact of force-killing — quit cleanly to
 avoid it. Timeline window: File → New Window. A persisted account auto-reauthorizes on launch.
 
+To test the UI without taking focus or moving the mouse: switch tabs with
+`perform action "AXPress" of menu item "<Likes|My Account|…>" of menu 1 of menu item "Tabs" of
+menu 1 of menu bar item "View"`, page a list by setting `value of scroll bar 1 of scroll area 1 of
+splitter group 1 of window 1` to 1.0, and capture the window even when it's covered with
+`screencapture -x -o -l <CGWindowID>` (find the id with JXA `CGWindowListCopyWindowInfo`). The
+compact sidebar icons and the profile's Followers/Following counts have no AX action and need a
+real click.
+
 ## Reverse-engineering findings (the hard-won bits)
 
 - **Injection**: arm64 slice has only 16 bytes of header padding, so a from-scratch Node
@@ -206,6 +214,66 @@ avoid it. Timeline window: File → New Window. A persisted account auto-reautho
   for a trend's name is answered from that feed (rank ids). Bluesky has no server-side saved
   searches: they live in the app's defaults (`atbotSavedSearches`; prototype:
   `bridge/.saved-searches.json`).
+- **People lists** (Followers / Following, Retweeted by, the account's background loaders): all
+  go through `PTHTweetbotCursorCursorPager`. `followers/ids` / `friends/ids` /
+  `statuses/retweeters/ids` answer `{ids, next_cursor}` (`cursor=-1` first, then the int64
+  `next_cursor` until 0), then Tweetbot POSTs `users/lookup.json` (form `user_id=a,b,…`, ≤100 per
+  call, run concurrently; a single id goes to `users/show` instead) and matches the array by `id`,
+  marking the rest missing. atproto cursors are strings, so each one gets an integer stand-in
+  (`stableId(cursor)`) in a cursor map. An unknown cursor restarts at the top:
+  `PTHTweetbotAccountDataTIDLoader` keeps its `next_cursor` in SQLite (`tid_loader_states`) across
+  launches. That loader also pulls `blocks/ids`, `mutes/users/ids` and
+  `friendships/no_retweets/ids` for the account (not served yet). An unknown numeric user id stays
+  unknown here (empty page), never the signed-in user's lists. "Liked by"
+  (`PTHTweetbotStatusFavoritesCursor`) only reads the local `interactions` DB and sends no request.
+- **Relationship**: `friendships/show.json` → `relationship.source.{following, followed_by,
+  blocking, blocked_by, muting, can_dm, want_retweets}` (`-[PTHTweetbotOtherUser
+  updateRelationship:]`), filled from `getProfile`'s `viewer`. `can_dm` stays false until DMs exist.
+- **Likes tab**: `favorites/list.json` (`PTHTweetbotFavoritesCursor`, TID pager) → `getActorLikes`,
+  which only answers for the signed-in user (anyone else's Likes tab gets `[]`). Each liked post is
+  served under its **like record's** TID snowflake (`viewer.like`), so the list keeps like order
+  and pages cleanly by `max_id`. With post ids it would re-sort by post date and drop items.
+- **The App Group container (account directory)**: `+[PTHTweetbotAccount containerURL]` is
+  Tapbots' App Group (`~/Library/Group Containers/9JTH7AWHE6.com.tapbots.Tweetbot3Mac`, which
+  holds the original Tweetbot's data). It isn't nil, but with that entitlement stripped the
+  sandbox can't write there, so nothing per-account under `<tid>.accountd/` persists: `data.sql`
+  (follower/friend/block/mute ids, interactions), `messages.sql`, drafts, filters. The
+  `PTHTweetbotAccountData*Loader`s and "Liked by" never get a store. Only `messages.sql` is
+  redirected so far (`installMessagesStoreFallback` in redirect.m, into our own container,
+  while `-[PTHTweetbotAccountMessages initWithAccount:]` runs). Widening it would also restore
+  cached posts across launches, which needs the bridge's id registries to survive relaunches
+  first.
+- **DMs** (`PTHTweetbotAccountMessages`, Model): Twitter's DM events API.
+  `direct_messages/events/list.json?count=50[&cursor=]`, following `next_cursor` until it meets
+  a message id it already holds, so a cold start pages through everything. Each
+  `message_create` event (`id`, `created_timestamp`, `message_create.{sender_id,
+  target.recipient_id, message_data.{text, entities, attachment}}`) is filed into a thread
+  keyed by the other user's id, then `users/lookup` for the partners. Sending is a **JSON** POST
+  to `events/new.json` (`{event: {type, message_create: …}}` → `{event}`), deleting `DELETE
+  events/destroy.json?id=` (204), and reloading one message `events/show.json?id=`. Served from
+  `chat.bsky.convo.*` through the PDS with `atproto-proxy: did:web:api.bsky.chat#bsky_chat`. The
+  app password needs "Allow access to your direct messages" (otherwise "Bad token scope").
+  Event ids are snowflakes from the message's TID. The list is a lazy newest-first merge over
+  `listConvos` + per-conversation `getMessages` cached by `rev`, so a quiet poll is one
+  `listConvos`; a cursor (cold start) fetches the rest concurrently. Only 1:1 conversations; a
+  shared post is appended as a twitter.com permalink to its registered id (opens in-app). Ids
+  from a previous launch (Tweetbot keeps `messages.sql`) re-index all conversations on a miss,
+  and unknown `users/lookup` ids re-list conversations to re-register the partners.
+- **The DM gates**: (1) `_PTHTweetbotAccountRequestOperation` only turns on an account's
+  `hasDirectMessageAccess` when a response carries `X-Access-Level: read-write-directmessages`
+  (Twitter's token permission), so every bridge response sends it. (2) `-[PTHTweetbotAccountMessages
+  refresh:]` queues until the store's `_hasLoaded`, which needs `messages.sql` to open (see the
+  App Group bullet). Either one alone leaves the Messages tab spinning with no request sent.
+- **DM read state**: Tweetbot-local. Each thread has a `lastReadTID` in the account's defaults
+  (`MessagesLastRead.<other id>`, thread key `"<account id>.<other id>"`), and received
+  messages newer than it are unread. Bluesky → Tweetbot: after each list poll the bridge writes
+  "read up to" (from each conversation's `unreadCount`) with
+  `+[PTHTweetbotDirectMessageThread _updateLastReadTID:threadKey:]`, which only moves forward.
+  Not the public `updateLastReadTID:threadKey:`: its `directMessageThreadForUserTID:` lookup
+  **creates and stores** an empty thread for an unknown user. Threads it already holds get
+  `_updateCounts`. Tweetbot → Bluesky: redirect.m hooks `-[PTHTweetbotDirectMessageThread
+  setLastReadTID:]` (what `markRead` calls) → `bridge_dm_mark_read` →
+  `chat.bsky.convo.updateRead`. The sync path never calls that setter, so there's no loop.
 - **Feeds = Twitter lists**: Tweetbot's timeline-title dropdown is filled from `lists/list.json`.
   We answer it with the user's saved feeds (`getPreferences` → `savedFeedsPrefV2`, pinned first,
   skipping the `timeline`/following entry; hydrated via `getFeedGenerators` / `getList`), and
@@ -241,6 +309,12 @@ avoid it. Timeline window: File → New Window. A persisted account auto-reautho
 - **Query encoding**: build XRPC query strings with `&=+#?` percent-encoded.
   `URLQueryAllowedCharacterSet` leaves `+` alone, the server reads it as a space, and feed
   cursors containing `+` silently re-serve page 1.
+- **Tab shortcuts (⌘1–⌘8)**: View → Tabs items send nil-targeted `changeTab:` (tag = tab), which
+  only `PTHTweetbotMainViewController` (the main window's `contentViewController`) implements,
+  so they die when another window is key or the main window is minimised/closed. `redirect.m`
+  adds `-changeTab:` to `PTHTweetbotAppDelegate` (end of the responder chain): bring the
+  front-most `mainWindowControllers` window forward (or `newMainWindow:` if none), then call
+  the VC's `changeTab:` directly. lldb attaches fine to the running ad-hoc `atbot` for this kind of RE.
 - **Testing dialog gotcha**: the macOS "unexpectedly quit… Reopen?" loop during testing is a
   self-inflicted artifact of force-killing atbot. Quit cleanly
   (`osascript -e 'tell application "atbot" to quit'`), and/or
@@ -281,6 +355,10 @@ avoid it. Timeline window: File → New Window. A persisted account auto-reautho
   re-fetch). **Web permalinks** (bsky.app) for Copy Link / Open in Browser.
 - **Search**: posts (with Twitter operators), people, trends (served from their trending
   feeds), saved searches (local), and quote-posts of yours mixed into Mentions.
+- **People**: the Likes tab, Followers / Following lists (+ `users/lookup`), profile relationship
+  ("Follows you", blocking, muting) and Retweeted by.
+- **DMs**: threads, send, delete-for-yourself, shared posts, read state synced both ways, and
+  `can_dm` from the recipient's `allowIncoming` chat setting.
 - **Dependency-free injection**: PTHCommon has ~5 KB header padding (the main binary has 16
   bytes), so `inject-framework.mjs` adds the `LC_LOAD_DYLIB` in place — no LIEF, no relocation.
   `DYLD_INSERT_LIBRARIES` is out (the sandboxed/signed binary is "restricted", dyld strips it).
@@ -292,8 +370,10 @@ avoid it. Timeline window: File → New Window. A persisted account auto-reautho
 
 ## Still TODO
 
-- DMs, media upload, richer notifications. Search: `OR` queries (Bluesky can't), and the UI
-  still says "Search Twitter".
+- Media upload (posts and DMs), richer notifications. Search: `OR` queries (Bluesky can't),
+  and the UI still says "Search Twitter".
+- **Per-account persistence**: give the rest of `<tid>.accountd` a writable home (see the App
+  Group bullet), after making the bridge's post/actor registries survive relaunches.
 - **Sync the Node prototype**: lists + web-permalink helpers were added to `bridge.m` only; the
   `bridge/*.mjs` prototype lacks them. Mirror if you iterate there.
 

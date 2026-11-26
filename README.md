@@ -24,7 +24,8 @@ You need a Mac running macOS 11 or later, and a Bluesky account.
    [latest release](https://github.com/orta/tweetbot-to-atbot/releases/latest), unzip it
    and open **Atbotify**.
 3. **Make an app password** at bsky.app → Settings → Privacy and Security → App Passwords.
-   Don't use your main password.
+   Don't use your main password. Tick **Allow access to your direct messages** if you want
+   your DMs in atbot.
 4. **Enter your handle and the app password**, then click **Create atbot…** and choose
    where to save it.
 
@@ -57,6 +58,10 @@ Working today (verified end-to-end against a real account on a custom PDS):
   Mutuals, …) and lists appear as Tweetbot "lists"; click the **Timeline** title to switch
 - ✅ **Writes** — post (with link/mention facets), like, repost, follow, delete, all creating
   real atproto records; replies thread correctly
+- ✅ **People** — your Likes tab, Followers / Following lists, "Follows you" on profiles, and
+  who reposted a post
+- ✅ **Direct messages** — your Bluesky chats in the Messages tab: send, delete, shared posts,
+  and read/unread kept in sync with Bluesky
 - ✅ **Web permalinks** — Copy Link / Open in Browser point at `bsky.app`
 - ✅ **Search** — posts (Twitter operators like `from:`, `filter:media`, `min_faves:` work),
   people, Bluesky trending topics (opening one shows its trending feed), and saved searches;
@@ -69,7 +74,7 @@ Working today (verified end-to-end against a real account on a custom PDS):
 
 Not done yet:
 
-- 💬 DMs, media upload, `OR` in searches
+- 📷 Media upload (in posts and DMs), `OR` in searches
 - 🔔 Notifications beyond mentions / replies
 
 ## How it works

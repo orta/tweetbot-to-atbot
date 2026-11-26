@@ -71,8 +71,8 @@ final class Controller: NSObject, NSApplicationDelegate {
 
         let title = NSTextField(labelWithString: "Turn your Tweetbot into a Bluesky client")
         title.font = .boldSystemFont(ofSize: 15); title.frame = NSRect(x: 20, y: 420, width: 480, height: 22)
-        let sub = NSTextField(wrappingLabelWithString: "Point this at your installed Tweetbot and sign in with a Bluesky app password (bsky.app → Settings → App Passwords). Your copy is transformed in place; nothing is uploaded.")
-        sub.font = .systemFont(ofSize: 11); sub.textColor = .secondaryLabelColor; sub.frame = NSRect(x: 20, y: 376, width: 480, height: 40)
+        let sub = NSTextField(wrappingLabelWithString: "Point this at your installed Tweetbot and sign in with a Bluesky app password (bsky.app → Settings → App Passwords; allow direct messages for DMs). Your copy is transformed in place; nothing is uploaded.")
+        sub.font = .systemFont(ofSize: 11); sub.textColor = .secondaryLabelColor; sub.frame = NSRect(x: 20, y: 370, width: 480, height: 46)
 
         v.addSubview(title); v.addSubview(sub)
         v.addSubview(label("Tweetbot app", 350)); field(tweetbotField, 326, placeholder: "/Applications/Tweetbot.app"); v.addSubview(tweetbotField)

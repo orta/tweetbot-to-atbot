@@ -9,7 +9,7 @@
 //   BRIDGE_PDS           default https://bsky.social
 import http from "node:http";
 import { AtpClient } from "./atproto.mjs";
-import { userFromProfile, statusFromFeedItem, stableId, resolveActor, resolvePostRef, cardForId, buildFacets, twitterList, findList, listViewName, numId, snowflakeId, keyHash, tidMs, isoMs } from "./shapes.mjs";
+import { userFromProfile, statusFromFeedItem, stableId, resolveActor, registerActor, resolvePostRef, cardForId, buildFacets, twitterList, findList, listViewName, numId, snowflakeId, keyHash, tidMs, isoMs, postId, dmEvent, dmEventId, dmOtherDid } from "./shapes.mjs";
 import fs from "node:fs";
 import { quotedPost, TWITTER_DATE } from "./shapes.mjs";
 
@@ -286,6 +286,74 @@ const routes = [
       users = (r.items || []).map((it) => userFromProfile(it.subject));
     }
     return { users, next_cursor: 0, next_cursor_str: "0", previous_cursor: 0, previous_cursor_str: "0" };
+  }],
+
+  // --- people: the Likes tab, Followers / Following, relationship, Retweeted by ---
+  ["GET", /\/1\.1\/favorites\/list\.json/, (q) => {
+    // getActorLikes only answers for the signed-in user: Bluesky likes aren't browsable
+    // per profile, so anyone else's Likes tab is empty.
+    if (peopleActor(q.screen_name || q.user_id) !== atp.session.did &&
+        String(q.screen_name || "").toLowerCase() !== String(atp.session.handle || "").toLowerCase()) return [];
+    return pagedFeed("likes", q, false, likesFetch(clampCount(q.count)));
+  }],
+  ["GET", /\/1\.1\/(followers|friends)\/ids\.json/, (q, req, m) => {
+    const actor = peopleActor(q.screen_name || q.user_id);
+    if (!actor) return emptyIdsPage();
+    return m[1] === "followers"
+      ? peopleIdsPage("app.bsky.graph.getFollowers", { actor }, "followers", q.cursor)
+      : peopleIdsPage("app.bsky.graph.getFollows", { actor }, "follows", q.cursor);
+  }],
+  ["GET", /\/1\.1\/statuses\/retweeters\/ids\.json/, (q) => {
+    const ref = resolvePostRef(q.id);
+    return ref ? peopleIdsPage("app.bsky.feed.getRepostedBy", { uri: ref.uri }, "repostedBy", q.cursor) : emptyIdsPage();
+  }],
+  ...["GET", "POST"].map((method) => [method, /\/1\.1\/users\/lookup\.json/, (q, req) => {
+    const p = mergedParams(q, req);
+    return lookupUsers(p.user_id, p.screen_name);
+  }]),
+  ["GET", /\/1\.1\/friendships\/show\.json/, async (q) => {
+    const actor = q.target_screen_name ? resolveActor(q.target_screen_name, null) : peopleActor(q.target_id);
+    if (!actor) return notFound();
+    return relationshipJSON(await atp.view("app.bsky.actor.getProfile", { params: { actor } }));
+  }],
+
+  // --- direct messages (chat.bsky.convo.*), see dmEventsPage ---
+  ["GET", /\/1\.1\/direct_messages\/events\/list\.json/, (q) => dmEventsPage(q.cursor, q.count ? clampCount(q.count) : 50)],
+  ["GET", /\/1\.1\/direct_messages\/events\/show\.json/, async (q) => {
+    const ev = await dmLookupEvent(q.id);
+    const c = ev && (dmConvos || []).find((x) => x.id === ev.convoId);
+    const m = c && (await dmMessages(c)).find((x) => x.id === ev.messageId);
+    return m ? { event: toDMEvent(c, m) } : notFound();
+  }],
+  // PTHTweetbotDirectMessageDraft post:completion: POSTs JSON { event: { type, message_create:
+  // { target: { recipient_id }, message_data: { text[, attachment] } } } } and reads { event }.
+  ["POST", /\/1\.1\/direct_messages\/events\/new\.json/, async (q, req) => {
+    let body = {};
+    try { body = JSON.parse(req._body || "{}"); } catch {}
+    const mc = body?.event?.message_create;
+    if (!mc?.message_data) throw new Error("malformed direct message");
+    if (mc.message_data.attachment) throw new Error("Sending media in DMs isn't supported yet");
+    const rid = String(mc.target?.recipient_id ?? "");
+    const recipient = async () => {
+      const a = rid && rid !== selfUserId() ? resolveActor(rid, null) : null;
+      return a ? (a.startsWith("did:") ? a : await atp.resolveHandleToDid(a)) : null;
+    };
+    let other = await recipient();
+    if (!other) { await dmLoadConvos(); other = await recipient(); } // e.g. a thread restored from a previous run
+    if (!other) throw new Error("unknown recipient");
+    const { convo } = await atp.chat("chat.bsky.convo.getConvoForMembers", { params: { members: [other] } });
+    const text = String(mc.message_data.text || "");
+    const facets = await buildFacets(text, (h) => atp.resolveHandleToDid(h));
+    const sent = await atp.chat("chat.bsky.convo.sendMessage", { method: "POST", body: { convoId: convo.id, message: { text, ...(facets.length ? { facets } : {}) } } });
+    return { event: toDMEvent(convo, sent) };
+  }],
+  // Bluesky only deletes a message for yourself, as Twitter did.
+  ["DELETE", /\/1\.1\/direct_messages\/events\/destroy\.json/, async (q) => {
+    const ev = await dmLookupEvent(q.id);
+    if (!ev) return notFound();
+    await atp.chat("chat.bsky.convo.deleteMessageForSelf", { method: "POST", body: { convoId: ev.convoId, messageId: ev.messageId } });
+    dmMessageCache.delete(ev.convoId); // refetch without it
+    return { __raw: true, status: 204, body: "", ct: "application/json" };
   }],
 
   // --- user lookup ---
@@ -565,6 +633,222 @@ async function searchUsers(raw) {
   return actors.map((a) => userFromProfile(full.get(a.did) || a));
 }
 
+// ---- people (followers / following / reposted by, users/lookup) ----
+// Tweetbot loads every list of people the same way (PTHTweetbotFollowersCursor,
+// PTHTweetbotFollowingCursor, PTHTweetbotStatusRetweetsCursor, and the account's background
+// follower/friend loaders): an `ids` endpoint answering { ids, next_cursor }
+// (PTHTweetbotCursorCursorPager: cursor=-1 first, then next_cursor until it is 0), then a
+// users/lookup for the ids it hasn't loaded. atproto pages people with opaque string
+// cursors, so each one gets an integer stand-in.
+const peopleCursors = new Map(); // integer -> atproto cursor
+const selfUserId = () => stableId(atp.session?.did || "did:bridge");
+
+// The DID a people request is about. An unknown numeric id stays unknown (never the
+// signed-in user's lists in someone else's profile); the account's own id always resolves.
+function peopleActor(param) {
+  if (param == null || param === "" || String(param) === selfUserId()) return atp.session.did;
+  return resolveActor(param, null);
+}
+
+const emptyIdsPage = () => ({ ids: [], next_cursor: 0, next_cursor_str: "0", previous_cursor: 0, previous_cursor_str: "0" });
+
+// One page of the profiles in r[listKey] from `nsid`, as Twitter's ids page. Every actor is
+// registered so the users/lookup that follows can map its numeric id back to a DID.
+async function peopleIdsPage(nsid, params, listKey, cursorParam) {
+  const c = String(cursorParam ?? "");
+  // unknown (a cursor saved by a previous launch): start over from the top
+  const atCursor = c && c !== "-1" && c !== "0" ? peopleCursors.get(c) : undefined;
+  const r = await atp.view(nsid, { params: { ...params, limit: 100, ...(atCursor ? { cursor: atCursor } : {}) } });
+  const ids = [];
+  for (const a of r[listKey] || []) {
+    if (!a?.did) continue;
+    registerActor(a.did, a.handle);
+    ids.push(Number(stableId(a.did)));
+  }
+  let nextId = "0";
+  if (ids.length && r.cursor) {
+    nextId = stableId(r.cursor);
+    if (nextId === "0") nextId = "1";
+    if (peopleCursors.size > 2000) peopleCursors.clear();
+    peopleCursors.set(nextId, r.cursor);
+  }
+  return { ids, next_cursor: Number(nextId), next_cursor_str: nextId, previous_cursor: 0, previous_cursor_str: "0" };
+}
+
+// users/lookup (+[PTHTweetbotUser lookup:result:]): a POST of user_id=<id,…> (up to 100)
+// for the users an ids page named that it hasn't loaded. It matches the answer array by
+// `id` and marks the rest missing, so ids we can't map to a DID are simply left out.
+// getProfiles takes 25 actors per call; the chunks run concurrently.
+async function lookupUsers(userIds, screenNames) {
+  const split = (s) => String(s || "").split(",").map((x) => x.trim()).filter(Boolean);
+  const users = [], actors = [], unknown = [];
+  for (const s of split(userIds)) {
+    const card = cardForId(s); // a link card's synthetic "author"
+    if (card) { users.push(card.user); continue; }
+    const a = peopleActor(s);
+    if (!a) unknown.push(s);
+    else if (!actors.includes(a)) actors.push(a);
+  }
+  // Ids Tweetbot remembers from a previous run (its stored DM threads) aren't in the
+  // in-memory registry yet; listing the DM conversations registers everyone in them.
+  if (unknown.length && (await dmReloadPartners()))
+    for (const s of unknown) { const a = peopleActor(s); if (a && !actors.includes(a)) actors.push(a); }
+  for (const s of split(screenNames)) {
+    const a = resolveActor(s, null);
+    if (a && !actors.includes(a)) actors.push(a);
+  }
+  const chunks = [];
+  for (let i = 0; i < actors.length; i += 25) chunks.push(actors.slice(i, i + 25));
+  const pages = await Promise.all(chunks.map((chunk) => atp.view("app.bsky.actor.getProfiles", { params: { actors: chunk } }).catch(() => null)));
+  for (const pr of pages) for (const p of pr?.profiles || []) if (p?.did) users.push(userFromProfile(p));
+  return users;
+}
+
+// friendships/show (-[PTHTweetbotOtherUser updateRelationship:] reads relationship.source):
+// the signed-in user's side of the relationship with the profile `prof`, from its viewer state.
+function relationshipJSON(prof) {
+  const v = prof?.viewer || {};
+  const following = typeof v.following === "string", followedBy = typeof v.followedBy === "string";
+  const blocked = typeof v.blocking === "string" || v.blockedBy === true;
+  // Who may start a Bluesky chat with them: "all", "following" (people they follow, the
+  // default) or "none".
+  const allow = prof?.associated?.chat?.allowIncoming || "following";
+  const canDM = !blocked && (allow === "all" || (allow === "following" && followedBy));
+  const sid = selfUserId(), tid = stableId(prof?.did || "");
+  return { relationship: {
+    source: {
+      id: Number(sid), id_str: sid, screen_name: atp.session?.handle || "",
+      following, followed_by: followedBy,
+      blocking: typeof v.blocking === "string", blocked_by: v.blockedBy === true, muting: v.muted === true,
+      can_dm: canDM,
+      want_retweets: true, notifications_enabled: false, all_replies: false, marked_spam: false,
+      following_received: false, following_requested: false, live_following: false,
+    },
+    target: {
+      id: Number(tid), id_str: tid, screen_name: prof?.handle || "",
+      following: followedBy, followed_by: following, following_received: false, following_requested: false,
+    },
+  } };
+}
+
+// ---- direct messages (chat.bsky.convo.*) ----
+// Tweetbot polls direct_messages/events/list.json?count=50[&cursor=] and follows next_cursor
+// until it meets a message it already holds (a cold start pages through everything). The
+// list is a newest-first merge across the 1:1 conversations, built lazily: a conversation
+// whose last message is older than the page's last event can't contribute, so a quiet poll
+// costs one listConvos. Messages are cached per conversation by its rev. The dylib also
+// syncs read state with Tweetbot's own store and gives it a messages.sql it can open; the
+// prototype can't (it runs outside the app). Full notes: inject/bridge.m.
+let dmConvos = null;
+const dmMessageCache = new Map(); // convo id -> { rev, messages }
+const dmEvents = new Map();       // event id -> { convoId, messageId }
+let dmPartnersAt = 0, dmIndexedAt = 0;
+const dmLastId = (c) => (c.lastMessage ? BigInt(dmEventId(c.id, c.lastMessage)) : 0n);
+const byBigIdDesc = (a, b) => (b.id > a.id ? 1 : b.id < a.id ? -1 : 0);
+// Run fn over items, `n` at a time (be gentle with the chat service).
+async function inBatches(items, n, fn) {
+  for (let i = 0; i < items.length; i += n) await Promise.all(items.slice(i, i + n).map(fn));
+}
+
+// The 1:1 conversations (Twitter DMs have no groups), newest activity first. Members are
+// registered so users/lookup and sending can map numeric ids back to DIDs.
+async function dmLoadConvos() {
+  const out = [];
+  let cursor;
+  for (let page = 0; page < 5; page++) {
+    const r = await atp.chat("chat.bsky.convo.listConvos", { params: { limit: 100, ...(cursor ? { cursor } : {}) } });
+    for (const c of r.convos || []) {
+      if ((c.members || []).length !== 2 || !c.id || !dmOtherDid(c, atp.session.did)) continue;
+      for (const m of c.members) registerActor(m.did, m.handle);
+      out.push(c);
+    }
+    cursor = r.cursor;
+    if (!cursor) break;
+  }
+  out.sort((a, b) => byBigIdDesc({ id: dmLastId(a) }, { id: dmLastId(b) }));
+  return (dmConvos = out);
+}
+async function dmReloadPartners() {
+  if (Date.now() - dmPartnersAt < 60_000) return false;
+  dmPartnersAt = Date.now();
+  return dmLoadConvos().then(() => true, () => false);
+}
+
+// A conversation's messages (newest first, deleted ones dropped), cached by its rev.
+async function dmMessages(c) {
+  const hit = dmMessageCache.get(c.id);
+  if (hit && hit.rev === c.rev) return hit.messages;
+  const msgs = [];
+  let cursor;
+  for (let page = 0; page < 10; page++) {
+    const r = await atp.chat("chat.bsky.convo.getMessages", { params: { convoId: c.id, limit: 100, ...(cursor ? { cursor } : {}) } });
+    const batch = r.messages || [];
+    msgs.push(...batch.filter((m) => m?.$type === "chat.bsky.convo.defs#messageView"));
+    cursor = r.cursor;
+    if (batch.length < 100 || !cursor) break; // a short page is the rest of the history
+  }
+  dmMessageCache.set(c.id, { rev: c.rev, messages: msgs });
+  return msgs;
+}
+
+function toDMEvent(c, m) {
+  const ev = dmEvent(c, m, atp.session.did);
+  if (dmEvents.size > 20000) dmEvents.clear();
+  dmEvents.set(ev.id, { convoId: c.id, messageId: m.id });
+  return ev;
+}
+
+// One page of events/list: newest first, older than `cursor` (the previous page's last id).
+async function dmEventsPage(cursor, count) {
+  const before = /^\d+$/.test(cursor || "") ? BigInt(cursor) : 0n;
+  const convos = !before || !dmConvos ? await dmLoadConvos() : dmConvos;
+  // Tweetbot only pages past the first page on a cold start: it's about to want everything.
+  if (before) await inBatches(convos, 8, (c) => dmMessages(c).catch(() => null));
+  const cands = [];
+  let more = false;
+  for (const c of convos) {
+    if (cands.length >= count) {
+      cands.sort(byBigIdDesc);
+      // conversations come newest activity first: this one and all after it are older
+      if (dmLastId(c) <= cands[count - 1].id) { more = true; break; }
+    }
+    for (const m of await dmMessages(c).catch(() => [])) {
+      const id = BigInt(dmEventId(c.id, m));
+      if (!before || id < before) cands.push({ id, c, m });
+    }
+  }
+  cands.sort(byBigIdDesc);
+  if (cands.length > count) more = true;
+  const events = cands.slice(0, count).map(({ c, m }) => toDMEvent(c, m));
+  return { events, apps: {}, ...(more && events.length ? { next_cursor: events.at(-1).id } : {}) };
+}
+
+// The { convoId, messageId } behind an event id. A previous run's id isn't registered
+// until served again, so a miss re-indexes every conversation (at most once a minute).
+async function dmLookupEvent(id) {
+  const key = String(id || "");
+  if (!dmEvents.has(key) && key && Date.now() - dmIndexedAt > 60_000) {
+    dmIndexedAt = Date.now();
+    const convos = await dmLoadConvos();
+    await inBatches(convos, 8, async (c) => {
+      for (const m of await dmMessages(c).catch(() => [])) dmEvents.set(dmEventId(c.id, m), { convoId: c.id, messageId: m.id });
+    });
+  }
+  return dmEvents.get(key) || null;
+}
+
+// The Likes tab (PTHTweetbotFavoritesCursor) pages favorites/list by id like any timeline,
+// but likes run in the order they were LIKED. Post ids would re-sort them by post date and
+// break paging, so each liked post is served under its like record's TID id (viewer.like
+// is our own like record when the viewer is the liker).
+const likesFetch = (limit) => async (cursor) => {
+  const r = await viewFetch("app.bsky.feed.getActorLikes", { actor: atp.session.did, limit })(cursor);
+  return { ...r, feed: (r.feed || []).map((it) => {
+    const like = it?.post?.viewer?.like;
+    return typeof like === "string" && tidMs(rkeyOf(like)) ? { ...it, _id: postId(like) } : it;
+  }) };
+};
+
 // Saved searches: Bluesky keeps none server-side, so they live locally (the app uses its
 // own defaults; the prototype a gitignored JSON file next to this one). Stored as
 // { id, query, createdAt }; id = stableId(query), so saving twice is a no-op.
@@ -727,6 +1011,9 @@ const notFound = () => ({ __raw: true, status: 404, body: JSON.stringify({ error
 const redirect = (location) => ({ __redirect: true, location });
 
 const server = http.createServer(async (req, res) => {
+  // Twitter's token permission: Tweetbot only enables an account's DMs once a response
+  // says "read-write-directmessages" (_PTHTweetbotAccountRequestOperation).
+  res.setHeader("X-Access-Level", "read-write-directmessages");
   const u = new URL(req.url, "http://127.0.0.1");
   const q = Object.fromEntries(u.searchParams.entries());
   // capture body for POSTs (oauth/proxy protocol discovery)

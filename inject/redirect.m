@@ -354,6 +354,72 @@ static void installTabShortcutFallback(void) {
     tblog(@"tab-shortcut fallback on app delegate: %d", added);
 }
 
+// ---- DM read state -> Bluesky --------------------------------------------------
+// Reading a DM thread ends in -[PTHTweetbotDirectMessageThread setLastReadTID:] (markRead
+// passes the newest message). Pass it on so Bluesky's unread state follows. The bridge's
+// own Bluesky -> Tweetbot sync writes through the class-level _updateLastReadTID:threadKey:,
+// which never calls this setter, so the two can't ping-pong.
+static void (*orig_setLastReadTID)(id, SEL, long long);
+static void my_setLastReadTID(id self, SEL _cmd, long long tid) {
+    orig_setLastReadTID(self, _cmd, tid);
+    @try {
+        long long other = ((long long (*)(id, SEL))objc_msgSend)(self, sel_registerName("otherUserTID"));
+        bridge_dm_mark_read(other, tid);
+    } @catch (id e) { tblog(@"dm read hook failed: %@", e); }
+}
+
+static void installDMReadHook(void) {
+    Class t = objc_getClass("PTHTweetbotDirectMessageThread");
+    Method m = t ? class_getInstanceMethod(t, sel_registerName("setLastReadTID:")) : NULL;
+    if (!m) { tblog(@"PTHTweetbotDirectMessageThread setLastReadTID: not found (no DM read sync)"); return; }
+    orig_setLastReadTID = (void (*)(id, SEL, long long))method_setImplementation(m, (IMP)my_setLastReadTID);
+    tblog(@"dm read hook installed");
+}
+
+// ---- A home for the DM database ------------------------------------------------
+// Tweetbot keeps each account's databases in <App Group container>/Library/Application
+// Support/<account id>.accountd (+[PTHTweetbotAccount containerURL]). The App Group is
+// Tapbots' (~/Library/Group Containers/9JTH7AWHE6.com.tapbots.Tweetbot3Mac) and we strip
+// that entitlement to launch, so the sandbox can't write there: -[PTHTweetbotAccountMessages
+// initWithAccount:] can't open messages.sql, the store never finishes loading (_hasLoaded),
+// every refresh queues behind it, and the Messages tab spins forever. Give just that init
+// the same layout inside our own sandbox container. Everything else kept there (data.sql,
+// drafts, filters, the account list) still can't persist: widening this would restore
+// cached posts across launches, and the bridge's id registries are in-memory, so those
+// posts would stop resolving.
+static __thread BOOL tInMessagesInit = NO;
+static id (*orig_accountDirectory)(id, SEL);
+static id my_accountDirectory(id self, SEL _cmd) {
+    id dir = orig_accountDirectory(self, _cmd);
+    if (!tInMessagesInit) return dir;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([dir isKindOfClass:NSString.class] && [fm isWritableFileAtPath:dir]) return dir;
+    id tid = msg0(self, "tidValue");
+    if (![tid respondsToSelector:@selector(stringValue)]) return dir;
+    NSString *path = [[NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support"]
+                      stringByAppendingPathComponent:[[tid stringValue] stringByAppendingPathExtension:@"accountd"]];
+    [fm createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:NULL];
+    return path;
+}
+static id (*orig_messagesInit)(id, SEL, id);
+static id my_messagesInit(id self, SEL _cmd, id account) {
+    tInMessagesInit = YES;
+    tblog(@"messages store at %@", msg0(account, "accountDirectory"));
+    id r = orig_messagesInit(self, _cmd, account);
+    tInMessagesInit = NO;
+    return r;
+}
+
+static void installMessagesStoreFallback(void) {
+    Class acct = objc_getClass("PTHTweetbotAccount"), msgs = objc_getClass("PTHTweetbotAccountMessages");
+    Method dir = acct ? class_getInstanceMethod(acct, sel_registerName("accountDirectory")) : NULL;
+    Method init = msgs ? class_getInstanceMethod(msgs, sel_registerName("initWithAccount:")) : NULL;
+    if (!dir || !init) { tblog(@"messages store fallback: methods not found"); return; }
+    orig_accountDirectory = (id (*)(id, SEL))method_setImplementation(dir, (IMP)my_accountDirectory);
+    orig_messagesInit = (id (*)(id, SEL, id))method_setImplementation(init, (IMP)my_messagesInit);
+    tblog(@"messages store fallback installed");
+}
+
 __attribute__((constructor))
 static void tweetbot_atproto_init(void) {
     @autoreleasepool {
@@ -402,6 +468,8 @@ static void tweetbot_atproto_init(void) {
         installWebURLHooks();
         installLinkCardHooks();
         installTabShortcutFallback();
+        installDMReadHook();
+        installMessagesStoreFallback();
 
         tblog(@"redirector installed (NSURLSession + openURL hooks), bridge port %d", kBridgePort);
     }

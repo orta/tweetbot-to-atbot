@@ -13,6 +13,8 @@
 #import <netinet/in.h>
 #import <arpa/inet.h>
 #import <unistd.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
 
 #import "bridge.h"
 
@@ -22,6 +24,8 @@ extern void tblog(NSString *fmt, ...);
 // ---- forward declarations (definitions live in the shapes section below) ----
 static NSString *stableId(NSString *key);
 static NSString *resolveActor(NSString *param, NSString *fallbackDid);
+static NSString *selfUserId(void);
+static BOOL dmReloadPartners(void);
 static NSMutableDictionary<NSString *, NSString *> *gActorRegistry;      // id/handle -> did
 static NSMutableDictionary<NSString *, NSDictionary *> *gPostRegistry;   // id -> {uri,cid,...}
 
@@ -205,12 +209,13 @@ static BOOL atpEnsureSession(NSString **errOut) {
     }
 }
 
-static id atpAuthed(NSString *method, NSString *nsid, NSDictionary *params, NSData *body, BOOL proxy, NSString **errOut) {
+// `proxy`: the atproto-proxy service the PDS forwards to (nil = the PDS itself).
+static id atpAuthed(NSString *method, NSString *nsid, NSDictionary *params, NSData *body, NSString *proxy, NSString **errOut) {
     if (!atpEnsureSession(errOut)) return nil;
     NSString *url = [NSString stringWithFormat:@"%@/xrpc/%@%@", gPDS, nsid, qstr(params)];
     NSMutableDictionary *h = [NSMutableDictionary dictionary];
     if (gAccessJwt) h[@"authorization"] = [@"Bearer " stringByAppendingString:gAccessJwt];
-    if (proxy) h[@"atproto-proxy"] = @"did:web:api.bsky.app#bsky_appview";
+    if (proxy) h[@"atproto-proxy"] = proxy;
     if (body) h[@"content-type"] = @"application/json";
 
     NSInteger code = 0; NSString *err = nil;
@@ -224,8 +229,19 @@ static id atpAuthed(NSString *method, NSString *nsid, NSDictionary *params, NSDa
     if (code >= 400 || (!r && err)) { if (errOut) *errOut = err ?: [NSString stringWithFormat:@"%@ %ld", nsid, (long)code]; return nil; }
     return r;
 }
-static id atpView(NSString *nsid, NSDictionary *params, NSString **errOut) { return atpAuthed(@"GET", nsid, params, nil, YES, errOut); }
-static id atpCall(NSString *method, NSString *nsid, NSDictionary *params, NSData *body, NSString **errOut) { return atpAuthed(method, nsid, params, body, NO, errOut); }
+static id atpView(NSString *nsid, NSDictionary *params, NSString **errOut) { return atpAuthed(@"GET", nsid, params, nil, @"did:web:api.bsky.app#bsky_appview", errOut); }
+static id atpCall(NSString *method, NSString *nsid, NSDictionary *params, NSData *body, NSString **errOut) { return atpAuthed(method, nsid, params, body, nil, errOut); }
+// Bluesky DMs (chat.bsky.*): the PDS forwards to the chat service. The app password must
+// have been created with "Allow access to your direct messages".
+static id atpChat(NSString *method, NSString *nsid, NSDictionary *params, NSDictionary *json, NSString **errOut) {
+    NSData *body = json ? [NSJSONSerialization dataWithJSONObject:json options:0 error:NULL] : nil;
+    NSString *err = nil;
+    id r = atpAuthed(method, nsid, params, body, @"did:web:api.bsky.chat#bsky_chat", &err);
+    if (!r && [err.lowercaseString containsString:@"scope"]) // "Bad token scope"
+        err = @"Bluesky DMs need an app password created with \"Allow access to your direct messages\" ticked";
+    if (errOut) *errOut = err;
+    return r;
+}
 
 // ---- writes (com.atproto.repo.*) -------------------------------------------
 static NSString *nowISO(void) {
@@ -501,7 +517,8 @@ static NSDictionary *userFromProfile(NSDictionary *p) {
     return @{
         @"id_str": id_, @"id": numId(id_),
         @"screen_name": handle,
-        @"name": p[@"displayName"] ?: handle,
+        // many profiles have displayName "" — Tweetbot would show a blank name
+        @"name": [jsonString(p, @"displayName") stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].length ? p[@"displayName"] : handle,
         @"description": p[@"description"] ?: @"",
         @"location": @"", @"url": NSNull.null, @"protected": @NO, @"verified": @NO,
         @"followers_count": p[@"followersCount"] ?: @0,
@@ -1526,6 +1543,461 @@ static NSArray *searchUsers(NSString *q, NSString **errOut) {
     return users;
 }
 
+#pragma mark - People (followers / following / reposted by, users/lookup)
+
+// Tweetbot loads every list of people the same way (PTHTweetbotFollowersCursor,
+// PTHTweetbotFollowingCursor, PTHTweetbotStatusRetweetsCursor, and the account's background
+// follower/friend loaders): an `ids` endpoint answering { ids, next_cursor }
+// (PTHTweetbotCursorCursorPager: cursor=-1 first, then next_cursor until it is 0), then a
+// users/lookup for the ids it hasn't loaded. atproto pages people with opaque string
+// cursors, so each one gets an integer stand-in.
+static NSMutableDictionary<NSString *, NSString *> *gPeopleCursors = nil; // integer -> atproto cursor
+static NSObject *peopleLock(void) {
+    static NSObject *lock; static dispatch_once_t once; dispatch_once(&once, ^{ lock = [NSObject new]; });
+    return lock;
+}
+
+// The DID a people request is about. An unknown numeric id stays unknown (never the
+// signed-in user's lists in someone else's profile); the account's own id always resolves.
+static NSString *peopleActor(NSString *param) {
+    if (!param.length || [param isEqual:selfUserId()]) return gDID;
+    return resolveActor(param, nil);
+}
+
+static NSDictionary *emptyIdsPage(void) {
+    return @{ @"ids": @[], @"next_cursor": @0, @"next_cursor_str": @"0", @"previous_cursor": @0, @"previous_cursor_str": @"0" };
+}
+
+// One page of the profiles in r[listKey] from `nsid`, as Twitter's ids page. Every actor is
+// registered so the users/lookup that follows can map its numeric id back to a DID.
+static NSDictionary *peopleIdsPage(NSString *nsid, NSDictionary *params, NSString *listKey, NSString *cursorParam, NSString **errOut) {
+    NSString *atCursor = nil;
+    if (cursorParam.length && ![cursorParam isEqual:@"-1"] && ![cursorParam isEqual:@"0"]) {
+        // unknown (a cursor saved by a previous launch): start over from the top
+        @synchronized (peopleLock()) { atCursor = gPeopleCursors[cursorParam]; }
+    }
+    NSMutableDictionary *p = [params mutableCopy];
+    p[@"limit"] = @100;
+    if (atCursor) p[@"cursor"] = atCursor;
+    id r = atpView(nsid, p, errOut);
+    if (![r isKindOfClass:NSDictionary.class]) return nil;
+    NSMutableArray *ids = [NSMutableArray array];
+    for (NSDictionary *a in ([r[listKey] isKindOfClass:NSArray.class] ? r[listKey] : @[])) {
+        NSString *did = jsonString(a, @"did");
+        if (!did) continue;
+        registerActor(did, jsonString(a, @"handle"));
+        [ids addObject:numId(stableId(did))];
+    }
+    NSString *next = ids.count ? jsonString(r, @"cursor") : nil, *nextId = @"0";
+    if (next.length) {
+        nextId = stableId(next);
+        if ([nextId isEqual:@"0"]) nextId = @"1";
+        @synchronized (peopleLock()) {
+            if (!gPeopleCursors || gPeopleCursors.count > 2000) gPeopleCursors = [NSMutableDictionary dictionary];
+            gPeopleCursors[nextId] = next;
+        }
+    }
+    return @{ @"ids": ids, @"next_cursor": numId(nextId), @"next_cursor_str": nextId,
+              @"previous_cursor": @0, @"previous_cursor_str": @"0" };
+}
+
+// users/lookup (+[PTHTweetbotUser lookup:result:]): a POST of user_id=<id,…> (up to 100)
+// for the users an ids page named that it hasn't loaded. It matches the answer array by
+// `id` and marks the rest missing, so ids we can't map to a DID are simply left out.
+// getProfiles takes 25 actors per call; the chunks run concurrently.
+static NSArray *lookupUsers(NSString *userIds, NSString *screenNames) {
+    NSMutableArray *actors = [NSMutableArray array], *users = [NSMutableArray array], *unknown = [NSMutableArray array];
+    NSCharacterSet *ws = NSCharacterSet.whitespaceCharacterSet;
+    for (NSString *raw in [userIds ?: @"" componentsSeparatedByString:@","]) {
+        NSString *s = [raw stringByTrimmingCharactersInSet:ws];
+        if (!s.length) continue;
+        NSDictionary *card = cardForId(s); // a link card's synthetic "author"
+        if (card) { [users addObject:card[@"user"]]; continue; }
+        NSString *a = peopleActor(s);
+        if (!a.length) [unknown addObject:s];
+        else if (![actors containsObject:a]) [actors addObject:a];
+    }
+    // Ids Tweetbot remembers from a previous launch (its stored DM threads) aren't in the
+    // in-memory registry yet; listing the DM conversations registers everyone in them.
+    if (unknown.count && dmReloadPartners())
+        for (NSString *s in unknown) {
+            NSString *a = peopleActor(s);
+            if (a.length && ![actors containsObject:a]) [actors addObject:a];
+        }
+    for (NSString *raw in [screenNames ?: @"" componentsSeparatedByString:@","]) {
+        NSString *s = [raw stringByTrimmingCharactersInSet:ws];
+        NSString *a = s.length ? resolveActor(s, nil) : nil;
+        if (a.length && ![actors containsObject:a]) [actors addObject:a];
+    }
+    size_t chunks = (actors.count + 24) / 25;
+    NSMutableArray *pages = [NSMutableArray array];
+    for (size_t i = 0; i < chunks; i++) [pages addObject:NSNull.null];
+    dispatch_apply(chunks, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^(size_t i) {
+        NSArray *chunk = [actors subarrayWithRange:NSMakeRange(i * 25, MIN(25, actors.count - i * 25))];
+        id pr = atpView(@"app.bsky.actor.getProfiles", @{ @"actors": chunk }, NULL);
+        @synchronized (pages) { pages[i] = pr ?: NSNull.null; }
+    });
+    for (id pr in pages)
+        for (NSDictionary *p in ([pr isKindOfClass:NSDictionary.class] && [pr[@"profiles"] isKindOfClass:NSArray.class] ? pr[@"profiles"] : @[]))
+            if (jsonString(p, @"did")) [users addObject:userFromProfile(p)];
+    return users;
+}
+
+// friendships/show (-[PTHTweetbotOtherUser updateRelationship:] reads relationship.source):
+// the signed-in user's side of the relationship with the profile `prof`, from its viewer state.
+static NSDictionary *relationshipJSON(NSDictionary *prof) {
+    NSDictionary *v = [prof[@"viewer"] isKindOfClass:NSDictionary.class] ? prof[@"viewer"] : @{};
+    BOOL following = [v[@"following"] isKindOfClass:NSString.class];
+    BOOL followedBy = [v[@"followedBy"] isKindOfClass:NSString.class];
+    BOOL blocked = [v[@"blocking"] isKindOfClass:NSString.class] || [v[@"blockedBy"] isEqual:@YES];
+    // Who may start a Bluesky chat with them: "all", "following" (people they follow, the
+    // default) or "none".
+    NSDictionary *assoc = [prof[@"associated"] isKindOfClass:NSDictionary.class] ? prof[@"associated"] : nil;
+    NSString *allow = jsonString([assoc[@"chat"] isKindOfClass:NSDictionary.class] ? assoc[@"chat"] : nil, @"allowIncoming") ?: @"following";
+    BOOL canDM = !blocked && ([allow isEqual:@"all"] || ([allow isEqual:@"following"] && followedBy));
+    NSString *sid = selfUserId(), *tid = stableId(jsonString(prof, @"did") ?: @"");
+    return @{ @"relationship": @{
+        @"source": @{
+            @"id": numId(sid), @"id_str": sid, @"screen_name": gSessionHandle ?: gHandle ?: @"",
+            @"following": @(following), @"followed_by": @(followedBy),
+            @"blocking": @([v[@"blocking"] isKindOfClass:NSString.class]),
+            @"blocked_by": @([v[@"blockedBy"] isEqual:@YES]),
+            @"muting": @([v[@"muted"] isEqual:@YES]),
+            @"can_dm": @(canDM),
+            @"want_retweets": @YES, @"notifications_enabled": @NO, @"all_replies": @NO, @"marked_spam": @NO,
+            @"following_received": @NO, @"following_requested": @NO, @"live_following": @NO,
+        },
+        @"target": @{
+            @"id": numId(tid), @"id_str": tid, @"screen_name": jsonString(prof, @"handle") ?: @"",
+            @"following": @(followedBy), @"followed_by": @(following),
+            @"following_received": @NO, @"following_requested": @NO,
+        },
+    } };
+}
+
+// The Likes tab (PTHTweetbotFavoritesCursor) pages favorites/list by id like any timeline,
+// but likes run in the order they were LIKED. Post ids would re-sort them by post date and
+// break paging, so each liked post is served under its like record's TID id (viewer.like
+// is our own like record when the viewer is the liker).
+static FeedFetch likesFetch(NSInteger limit) {
+    FeedFetch inner = viewFetch(@"app.bsky.feed.getActorLikes", @{ @"actor": gDID ?: @"", @"limit": @(limit) });
+    return ^NSDictionary *(NSString *cursor, NSString **errOut) {
+        NSDictionary *r = inner(cursor, errOut);
+        if (![r[@"feed"] isKindOfClass:NSArray.class]) return r;
+        NSMutableArray *feed = [NSMutableArray array];
+        for (NSDictionary *it in r[@"feed"]) {
+            NSDictionary *post = [it isKindOfClass:NSDictionary.class] && [it[@"post"] isKindOfClass:NSDictionary.class] ? it[@"post"] : nil;
+            NSString *like = jsonString(post[@"viewer"], @"like");
+            if (!tidMs(like.lastPathComponent)) { [feed addObject:it]; continue; }
+            NSMutableDictionary *m = [it mutableCopy]; m[@"_id"] = postId(like);
+            [feed addObject:m];
+        }
+        NSMutableDictionary *out = [r mutableCopy]; out[@"feed"] = feed;
+        return out;
+    };
+}
+
+#pragma mark - Direct messages (chat.bsky.convo.*)
+
+// Tweetbot speaks Twitter's DM events API (PTHTweetbotAccountMessages). It polls
+// direct_messages/events/list.json?count=50[&cursor=] and keeps following next_cursor until
+// it meets a message id it already holds (so a cold start pages through everything), files
+// each message_create event into a thread keyed by the other user's id, sends with a JSON
+// POST to events/new.json, deletes with DELETE events/destroy.json?id= and reloads one
+// message with events/show.json?id=.
+//
+// Event ids are snowflakes from the message's TID, like post ids, so threads sort and
+// "already have it" works. The list is a newest-first merge across the 1:1 conversations:
+// listConvos (newest activity first) plus getMessages per conversation, cached by the
+// conversation's rev. Page one is built lazily (a conversation whose last message is older
+// than the page's last event can't contribute, so a quiet poll costs one listConvos); a
+// cursor means a cold start that wants everything, so the rest is fetched concurrently.
+static NSObject *dmLock(void) {
+    static NSObject *lock; static dispatch_once_t once; dispatch_once(&once, ^{ lock = [NSObject new]; });
+    return lock;
+}
+static NSArray<NSDictionary *> *gDMConvos = nil;                           // 1:1 conversations, newest activity first
+static NSMutableDictionary<NSString *, NSDictionary *> *gDMMessages = nil;  // convo id -> { rev, messages }
+static NSMutableDictionary<NSString *, NSDictionary *> *gDMEvents = nil;    // event id -> { convoId, messageId }
+static NSMutableDictionary<NSString *, NSString *> *gDMMarkedRead = nil;    // convo id -> message id Bluesky has as read
+
+static NSString *dmOtherDid(NSDictionary *convo) {
+    for (NSDictionary *m in ([convo[@"members"] isKindOfClass:NSArray.class] ? convo[@"members"] : @[])) {
+        NSString *did = jsonString(m, @"did");
+        if (did && ![did isEqual:gDID]) return did;
+    }
+    return nil;
+}
+static long long dmMessageMs(NSDictionary *msg) {
+    return tidMs(jsonString(msg, @"id")) ?: isoMs(jsonString(msg, @"sentAt"));
+}
+static NSString *dmEventId(NSString *convoId, NSDictionary *msg) {
+    NSString *key = [NSString stringWithFormat:@"%@/%@", convoId ?: @"", jsonString(msg, @"id") ?: @""];
+    long long ms = dmMessageMs(msg);
+    return ms ? [NSString stringWithFormat:@"%lld", snowflakeId(ms, keyHash(key))] : stableId(key);
+}
+// The event id of a conversation's newest message (0 when it has none).
+static long long dmLastId(NSDictionary *convo) {
+    NSDictionary *last = [convo[@"lastMessage"] isKindOfClass:NSDictionary.class] ? convo[@"lastMessage"] : nil;
+    return last ? queryId(dmEventId(convo[@"id"], last)) : 0;
+}
+static NSComparisonResult (^const dmNewestFirst)(NSDictionary *, NSDictionary *) = ^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+    long long x = [a[@"id"] longLongValue], y = [b[@"id"] longLongValue];
+    return x > y ? NSOrderedAscending : x < y ? NSOrderedDescending : NSOrderedSame;
+};
+
+// One chat message as a Twitter message_create event.
+static NSDictionary *dmEvent(NSDictionary *convo, NSDictionary *msg) {
+    NSString *convoId = jsonString(convo, @"id") ?: @"", *eid = dmEventId(convoId, msg);
+    NSString *sender = jsonString(msg[@"sender"], @"did") ?: @"";
+    NSDictionary *r = renderPost(msg, @{}, NO); // text + facets -> entities, code-point indices
+    NSMutableString *text = [r[@"full_text"] mutableCopy];
+    NSMutableDictionary *entities = [r[@"entities"] mutableCopy];
+    // A shared post (app.bsky.embed.record) is linked like a shared tweet. The twitter.com
+    // permalink opens it inside Tweetbot (statuses/show resolves the registered id).
+    NSDictionary *q = quotedPost(msg[@"embed"]);
+    if ([q[@"uri"] hasPrefix:@"at://"]) {
+        NSDictionary *qs = statusFromPost(q, NO);
+        NSString *handle = [qs[@"user"] isKindOfClass:NSDictionary.class] ? qs[@"user"][@"screen_name"] : nil;
+        NSArray *at = [[q[@"uri"] substringFromIndex:5] componentsSeparatedByString:@"/"];
+        NSString *permalink = [NSString stringWithFormat:@"https://twitter.com/%@/status/%@", handle ?: @"i", qs[@"id_str"]];
+        NSString *web = [NSString stringWithFormat:@"https://bsky.app/profile/%@/post/%@", handle.length ? handle : at.firstObject, at.lastObject];
+        if (text.length) [text appendString:@" "];
+        NSUInteger start = cpCount(text);
+        [text appendString:permalink];
+        NSMutableArray *urls = [entities[@"urls"] mutableCopy] ?: [NSMutableArray array];
+        [urls addObject:@{ @"url": permalink, @"expanded_url": permalink, @"display_url": prettyUrl(web), @"indices": @[@(start), @(cpCount(text))] }];
+        entities[@"urls"] = urls;
+    }
+    @synchronized (dmLock()) {
+        if (!gDMEvents || gDMEvents.count > 20000) gDMEvents = [NSMutableDictionary dictionary];
+        gDMEvents[eid] = @{ @"convoId": convoId, @"messageId": jsonString(msg, @"id") ?: @"" };
+    }
+    NSString *recipient = [sender isEqual:gDID] ? stableId(dmOtherDid(convo) ?: @"") : selfUserId();
+    return @{
+        @"type": @"message_create", @"id": eid,
+        @"created_timestamp": [NSString stringWithFormat:@"%lld", dmMessageMs(msg) ?: nowMs()],
+        @"message_create": @{
+            @"target": @{ @"recipient_id": recipient },
+            @"sender_id": stableId(sender),
+            @"message_data": @{ @"text": text, @"entities": entities },
+        },
+    };
+}
+
+// The 1:1 conversations (Twitter DMs have no groups), newest activity first. Members are
+// registered so users/lookup (thread names and avatars) and sending can map ids to DIDs.
+static NSArray *dmLoadConvos(NSString **errOut) {
+    NSMutableArray *out = [NSMutableArray array];
+    NSString *cursor = nil;
+    for (int page = 0; page < 5; page++) {
+        NSMutableDictionary *p = [@{ @"limit": @100 } mutableCopy];
+        if (cursor) p[@"cursor"] = cursor;
+        id r = atpChat(@"GET", @"chat.bsky.convo.listConvos", p, nil, errOut);
+        if (![r isKindOfClass:NSDictionary.class]) { if (page == 0) return nil; break; }
+        for (NSDictionary *c in ([r[@"convos"] isKindOfClass:NSArray.class] ? r[@"convos"] : @[])) {
+            NSArray *members = [c[@"members"] isKindOfClass:NSArray.class] ? c[@"members"] : @[];
+            if (members.count != 2 || !dmOtherDid(c) || !jsonString(c, @"id")) continue;
+            for (NSDictionary *m in members) registerActor(jsonString(m, @"did"), jsonString(m, @"handle"));
+            [out addObject:c];
+        }
+        cursor = jsonString(r, @"cursor");
+        if (!cursor.length) break;
+    }
+    [out sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        long long x = dmLastId(a), y = dmLastId(b);
+        return x > y ? NSOrderedAscending : x < y ? NSOrderedDescending : NSOrderedSame;
+    }];
+    @synchronized (dmLock()) { gDMConvos = out; }
+    return out;
+}
+
+// A conversation's messages (newest first, deleted ones dropped), cached by its rev.
+// `cachedOnly`: whatever is cached, even for an older rev; nil when nothing is.
+static NSArray *dmMessages(NSDictionary *convo, BOOL cachedOnly) {
+    NSString *convoId = jsonString(convo, @"id"), *rev = jsonString(convo, @"rev") ?: @"";
+    if (!convoId) return nil;
+    @synchronized (dmLock()) {
+        NSDictionary *hit = gDMMessages[convoId];
+        if (hit && (cachedOnly || [hit[@"rev"] isEqual:rev])) return hit[@"messages"];
+    }
+    if (cachedOnly) return nil;
+    NSMutableArray *msgs = [NSMutableArray array];
+    NSString *cursor = nil;
+    for (int page = 0; page < 10; page++) {
+        NSMutableDictionary *p = [@{ @"convoId": convoId, @"limit": @100 } mutableCopy];
+        if (cursor) p[@"cursor"] = cursor;
+        id r = atpChat(@"GET", @"chat.bsky.convo.getMessages", p, nil, NULL);
+        NSArray *batch = [r isKindOfClass:NSDictionary.class] && [r[@"messages"] isKindOfClass:NSArray.class] ? r[@"messages"] : nil;
+        if (!batch) { if (page == 0) return nil; break; } // don't cache a failed fetch
+        for (NSDictionary *m in batch)
+            if ([m isKindOfClass:NSDictionary.class] && [m[@"$type"] isEqual:@"chat.bsky.convo.defs#messageView"]) [msgs addObject:m];
+        cursor = jsonString(r, @"cursor");
+        if (batch.count < 100 || !cursor.length) break; // a short page is the rest of the history
+    }
+    @synchronized (dmLock()) {
+        if (!gDMMessages) gDMMessages = [NSMutableDictionary dictionary];
+        gDMMessages[convoId] = @{ @"rev": rev, @"messages": msgs };
+    }
+    return msgs;
+}
+
+// Bluesky's read state -> Tweetbot's: a per-thread lastReadTID in the account's defaults
+// ("MessagesLastRead.<other id>"), a received message being unread when it's newer.
+// Written with +[PTHTweetbotDirectMessageThread _updateLastReadTID:threadKey:] (the thread
+// key is "<account id>.<other id>"), which only moves forward, so this can mark threads read
+// but never unread. Not the public updateLastReadTID:threadKey:, whose thread lookup creates
+// (and stores) an empty thread for anyone Tweetbot hasn't loaded yet; a thread it already
+// holds gets _updateCounts so its badge refreshes.
+static void dmSyncReadState(NSArray *convos) {
+    NSMutableArray *marks = [NSMutableArray array]; // @[ other user id, read-up-to event id ]
+    for (NSDictionary *c in convos) {
+        NSString *other = dmOtherDid(c);
+        if (!other) continue;
+        NSInteger unread = [c[@"unreadCount"] isKindOfClass:NSNumber.class] ? [c[@"unreadCount"] integerValue] : 0;
+        long long upTo = 0;
+        if (unread <= 0) {
+            upTo = dmLastId(c);
+            NSString *lastId = jsonString(c[@"lastMessage"], @"id");
+            if (lastId) @synchronized (dmLock()) {
+                if (!gDMMarkedRead) gDMMarkedRead = [NSMutableDictionary dictionary];
+                gDMMarkedRead[c[@"id"]] = lastId; // nothing to tell Bluesky about this one
+            }
+        } else {
+            // Read up to the newest received message before the `unread` newest. A stale
+            // cache only lacks the newest messages, so it errs towards older (still unread).
+            NSMutableArray *received = [NSMutableArray array];
+            for (NSDictionary *m in (dmMessages(c, YES) ?: @[]))
+                if (![jsonString(m[@"sender"], @"did") isEqual:gDID]) [received addObject:@{ @"id": @(queryId(dmEventId(c[@"id"], m))) }];
+            [received sortUsingComparator:dmNewestFirst];
+            if (received.count > (NSUInteger)unread) upTo = [received[unread][@"id"] longLongValue];
+        }
+        if (upTo > 0) [marks addObject:@[@(queryId(stableId(other))), @(upTo)]];
+    }
+    if (!marks.count) return;
+    long long account = queryId(selfUserId());
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            Class T = objc_getClass("PTHTweetbotDirectMessageThread"), A = objc_getClass("PTHTweetbotAccount");
+            SEL upd = sel_registerName("_updateLastReadTID:threadKey:");
+            if (!T || ![T respondsToSelector:upd]) return;
+            NSMutableSet *changed = [NSMutableSet set];
+            for (NSArray *mk in marks) {
+                NSString *key = [NSString stringWithFormat:@"%lld.%lld", account, [mk[0] longLongValue]];
+                if (((BOOL (*)(id, SEL, long long, id))objc_msgSend)(T, upd, [mk[1] longLongValue], key)) [changed addObject:mk[0]];
+            }
+            if (!changed.count) return;
+            id acct = A ? ((id (*)(id, SEL, long long))objc_msgSend)(A, sel_registerName("accountWithTID:"), account) : nil;
+            id am = [acct respondsToSelector:sel_registerName("accountMessages")] ? ((id (*)(id, SEL))objc_msgSend)(acct, sel_registerName("accountMessages")) : nil;
+            id threads = [am respondsToSelector:sel_registerName("threads")] ? ((id (*)(id, SEL))objc_msgSend)(am, sel_registerName("threads")) : nil;
+            for (id th in ([threads isKindOfClass:NSArray.class] ? threads : @[])) {
+                long long o = ((long long (*)(id, SEL))objc_msgSend)(th, sel_registerName("otherUserTID"));
+                if ([changed containsObject:@(o)]) ((void (*)(id, SEL))objc_msgSend)(th, sel_registerName("_updateCounts"));
+            }
+            tblog(@"[bridge] dm: %lu thread(s) marked read from Bluesky", (unsigned long)changed.count);
+        } @catch (id e) { tblog(@"[bridge] dm read sync failed: %@", e); }
+    });
+}
+
+// One page of events/list: newest first, older than `cursor` (the last event id of the
+// previous page) when given.
+static NSDictionary *dmEventsPage(NSString *cursor, NSInteger count, NSString **errOut) {
+    long long before = queryId(cursor);
+    NSArray *convos = nil;
+    @synchronized (dmLock()) { convos = gDMConvos; }
+    if (!before || !convos) { convos = dmLoadConvos(errOut); if (!convos) return nil; }
+    // Tweetbot only pages past the first page when it holds nothing newer (a cold start),
+    // so it is about to want everything: fetch the stale conversations all at once.
+    if (before) dispatch_apply(convos.count, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^(size_t i) { dmMessages(convos[i], NO); });
+    NSMutableArray<NSDictionary *> *cands = [NSMutableArray array]; // { id, convo, msg }
+    BOOL more = NO;
+    for (NSDictionary *convo in convos) {
+        if (cands.count >= (NSUInteger)count) {
+            [cands sortUsingComparator:dmNewestFirst];
+            // conversations come newest activity first: this one and all after it are older
+            if (dmLastId(convo) <= [cands[count - 1][@"id"] longLongValue]) { more = YES; break; }
+        }
+        for (NSDictionary *m in (dmMessages(convo, NO) ?: @[])) {
+            long long eid = queryId(dmEventId(convo[@"id"], m));
+            if (!before || eid < before) [cands addObject:@{ @"id": @(eid), @"convo": convo, @"msg": m }];
+        }
+    }
+    [cands sortUsingComparator:dmNewestFirst];
+    if (cands.count > (NSUInteger)count) more = YES;
+    NSMutableArray *events = [NSMutableArray array];
+    for (NSUInteger i = 0; i < MIN(cands.count, (NSUInteger)count); i++) [events addObject:dmEvent(cands[i][@"convo"], cands[i][@"msg"])];
+    if (!before) dmSyncReadState(convos);
+    NSMutableDictionary *out = [@{ @"events": events, @"apps": @{} } mutableCopy];
+    if (more && events.count) out[@"next_cursor"] = [events.lastObject[@"id"] description];
+    return out;
+}
+
+// At most once per `seconds` (per *last), for the re-listing fallbacks below.
+static BOOL dmThrottle(double *last, double seconds) {
+    @synchronized (dmLock()) {
+        double now = NSDate.timeIntervalSinceReferenceDate;
+        if (now - *last < seconds) return NO;
+        *last = now;
+        return YES;
+    }
+}
+static double gDMPartnersAt = 0, gDMIndexedAt = 0;
+
+// Re-list the conversations so every DM partner is registered (users/lookup of ids that
+// Tweetbot's stored threads carry over from a previous launch). Throttled.
+static BOOL dmReloadPartners(void) {
+    return dmThrottle(&gDMPartnersAt, 60) && dmLoadConvos(NULL) != nil;
+}
+
+// The { convoId, messageId } behind an event id. Ids from a previous launch (Tweetbot keeps
+// its messages.sql) aren't registered until they're served again, so a miss re-indexes every
+// conversation (at most once a minute).
+static NSDictionary *dmLookupEvent(NSString *eid) {
+    NSDictionary *ev;
+    @synchronized (dmLock()) { ev = gDMEvents[eid ?: @""]; }
+    if (ev || !eid.length || !dmThrottle(&gDMIndexedAt, 60)) return ev;
+    NSArray *convos = dmLoadConvos(NULL);
+    dispatch_apply(convos.count, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^(size_t i) { dmMessages(convos[i], NO); });
+    @synchronized (dmLock()) {
+        if (!gDMEvents) gDMEvents = [NSMutableDictionary dictionary];
+        for (NSDictionary *c in convos)
+            for (NSDictionary *m in (gDMMessages[c[@"id"]][@"messages"] ?: @[]))
+                gDMEvents[dmEventId(c[@"id"], m)] = @{ @"convoId": c[@"id"], @"messageId": jsonString(m, @"id") ?: @"" };
+        ev = gDMEvents[eid];
+    }
+    return ev;
+}
+
+// The cached message behind an event id we handed out, as { convo, msg } (nil if unknown).
+static NSDictionary *dmFindEvent(NSString *eid) {
+    NSDictionary *ev = dmLookupEvent(eid);
+    if (!ev) return nil;
+    NSArray *convos;
+    @synchronized (dmLock()) { convos = gDMConvos; }
+    for (NSDictionary *c in convos) {
+        if (![c[@"id"] isEqual:ev[@"convoId"]]) continue;
+        for (NSDictionary *m in (dmMessages(c, NO) ?: @[]))
+            if ([jsonString(m, @"id") isEqual:ev[@"messageId"]]) return @{ @"convo": c, @"msg": m };
+    }
+    return nil;
+}
+
+void bridge_dm_mark_read(long long otherUserTID, long long lastReadTID) {
+    (void)otherUserTID;
+    NSString *eid = [NSString stringWithFormat:@"%lld", lastReadTID];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSDictionary *ev = dmLookupEvent(eid);
+        @synchronized (dmLock()) {
+            if (!ev || [gDMMarkedRead[ev[@"convoId"]] isEqual:ev[@"messageId"]]) return; // unknown, or already read
+            if (!gDMMarkedRead) gDMMarkedRead = [NSMutableDictionary dictionary];
+            gDMMarkedRead[ev[@"convoId"]] = ev[@"messageId"];
+        }
+        NSString *err = nil;
+        id r = atpChat(@"POST", @"chat.bsky.convo.updateRead", nil, @{ @"convoId": ev[@"convoId"], @"messageId": ev[@"messageId"] }, &err);
+        tblog(@"[bridge] dm read -> Bluesky (%@): %@", ev[@"convoId"], r ? @"ok" : err);
+    });
+}
+
 // Saved searches: Bluesky keeps none server-side, so they live in the app's own
 // defaults (the sandbox container, so they survive relaunches and dylib reloads).
 // Stored as { id, query, createdAt }; id = stableId(query), so saving twice is a no-op.
@@ -1630,6 +2102,7 @@ static BridgeResp jsonResp(id obj) {
 }
 static BridgeResp rawResp(NSString *body, NSString *ct) { return (BridgeResp){ 200, ct, [body dataUsingEncoding:NSUTF8StringEncoding] }; }
 static BridgeResp errResp(NSString *msg) {
+    tblog(@"[bridge] error: %@", msg ?: @"error");
     NSData *d = [NSJSONSerialization dataWithJSONObject:@{ @"errors": @[@{ @"code": @131, @"message": msg ?: @"error" }] } options:0 error:NULL];
     return (BridgeResp){ 500, @"application/json", d };
 }
@@ -1697,6 +2170,38 @@ static id synthStatus(NSString *uri, NSString *cid, NSDictionary *record) {
         @"replyCount": @0, @"repostCount": @0, @"likeCount": @0, @"indexedAt": record[@"createdAt"] ?: nowISO(),
     };
     return statusFromFeedItem(@{ @"post": post });
+}
+
+// events/new.json (PTHTweetbotDirectMessageDraft post:completion:) POSTs JSON
+// { event: { type, message_create: { target: { recipient_id }, message_data: { text[,
+// attachment] } } } } and reads back { event }: getConvoForMembers + sendMessage.
+static BridgeResp dmSend(NSData *body) {
+    id j = body.length ? [NSJSONSerialization JSONObjectWithData:body options:0 error:NULL] : nil;
+    NSDictionary *event = [j isKindOfClass:NSDictionary.class] && [j[@"event"] isKindOfClass:NSDictionary.class] ? j[@"event"] : nil;
+    NSDictionary *mc = [event[@"message_create"] isKindOfClass:NSDictionary.class] ? event[@"message_create"] : nil;
+    NSDictionary *data = [mc[@"message_data"] isKindOfClass:NSDictionary.class] ? mc[@"message_data"] : nil;
+    NSDictionary *target = [mc[@"target"] isKindOfClass:NSDictionary.class] ? mc[@"target"] : nil;
+    if (!data) return errResp(@"malformed direct message");
+    if (data[@"attachment"]) return errResp(@"Sending media in DMs isn't supported yet");
+    NSString *rid = [target[@"recipient_id"] description];
+    NSString *(^recipient)(void) = ^NSString *{
+        NSString *a = rid.length && ![rid isEqual:selfUserId()] ? resolveActor(rid, nil) : nil;
+        return a.length ? resolveHandleToDid(a) : nil;
+    };
+    NSString *other = recipient();
+    if (!other) { dmLoadConvos(NULL); other = recipient(); } // e.g. a thread restored from a previous launch
+    if (!other) return errResp(@"unknown recipient");
+    NSString *err = nil;
+    id cr = atpChat(@"GET", @"chat.bsky.convo.getConvoForMembers", @{ @"members": @[other] }, nil, &err);
+    NSDictionary *convo = [cr isKindOfClass:NSDictionary.class] && [cr[@"convo"] isKindOfClass:NSDictionary.class] ? cr[@"convo"] : nil;
+    if (!jsonString(convo, @"id")) return errResp(err ?: @"no conversation");
+    NSString *text = [data[@"text"] isKindOfClass:NSString.class] ? data[@"text"] : @"";
+    NSMutableDictionary *message = [@{ @"text": text } mutableCopy];
+    NSArray *facets = buildFacets(text);
+    if (facets.count) message[@"facets"] = facets;
+    id sent = atpChat(@"POST", @"chat.bsky.convo.sendMessage", nil, @{ @"convoId": convo[@"id"], @"message": message }, &err);
+    if (![sent isKindOfClass:NSDictionary.class]) return errResp(err);
+    return jsonResp(@{ @"event": dmEvent(convo, sent) });
 }
 
 static BridgeResp routeRequest(NSString *method, NSString *path, NSDictionary *query, NSData *body) {
@@ -1976,6 +2481,72 @@ static BridgeResp routeRequest(NSString *method, NSString *path, NSDictionary *q
         return jsonResp(@{ @"users": users, @"next_cursor": @0, @"next_cursor_str": @"0", @"previous_cursor": @0, @"previous_cursor_str": @"0" });
     }
 
+    // ---- people: the Likes tab, Followers / Following, relationship, Retweeted by ----
+    if ([path containsString:@"/favorites/list"]) {
+        // getActorLikes only answers for the signed-in user: Bluesky likes aren't browsable
+        // per profile, so anyone else's Likes tab is empty.
+        if (![peopleActor(query[@"screen_name"] ?: query[@"user_id"]) isEqual:gDID] &&
+            ![[query[@"screen_name"] lowercaseString] isEqual:gSessionHandle.lowercaseString]) return jsonResp(@[]);
+        NSString *err = nil;
+        NSArray *out = pagedFeed(@"likes", query, NO, likesFetch(clampCount(query[@"count"])), &err);
+        if (!out) return errResp(err);
+        return jsonResp(out);
+    }
+    if ([path containsString:@"/followers/ids"] || [path containsString:@"/friends/ids"]) {
+        BOOL followers = [path containsString:@"/followers/"];
+        NSString *actor = peopleActor(query[@"screen_name"] ?: query[@"user_id"]);
+        if (!actor.length) return jsonResp(emptyIdsPage());
+        NSString *err = nil;
+        NSDictionary *page = peopleIdsPage(followers ? @"app.bsky.graph.getFollowers" : @"app.bsky.graph.getFollows",
+                                           @{ @"actor": actor }, followers ? @"followers" : @"follows", query[@"cursor"], &err);
+        if (!page) return errResp(err);
+        return jsonResp(page);
+    }
+    if ([path containsString:@"/statuses/retweeters/ids"]) {
+        NSDictionary *ref = resolvePostRef(query[@"id"]);
+        if (!ref[@"uri"]) return jsonResp(emptyIdsPage());
+        NSString *err = nil;
+        NSDictionary *page = peopleIdsPage(@"app.bsky.feed.getRepostedBy", @{ @"uri": ref[@"uri"] }, @"repostedBy", query[@"cursor"], &err);
+        if (!page) return errResp(err);
+        return jsonResp(page);
+    }
+    if ([path containsString:@"/users/lookup"]) {
+        return jsonResp(lookupUsers(query[@"user_id"], query[@"screen_name"]));
+    }
+    if ([path containsString:@"/friendships/show"]) {
+        NSString *actor = query[@"target_screen_name"] ? resolveActor(query[@"target_screen_name"], nil) : peopleActor(query[@"target_id"]);
+        if (!actor.length) return notFoundResp();
+        NSString *err = nil; id prof = atpView(@"app.bsky.actor.getProfile", @{ @"actor": actor }, &err);
+        if (![prof isKindOfClass:NSDictionary.class]) return errResp(err);
+        return jsonResp(relationshipJSON(prof));
+    }
+
+    // ---- direct messages (chat.bsky.convo.*) ----
+    if ([path containsString:@"/direct_messages/events/list"]) {
+        NSString *err = nil;
+        NSDictionary *page = dmEventsPage(query[@"cursor"], query[@"count"] ? clampCount(query[@"count"]) : 50, &err);
+        if (!page) return errResp(err);
+        return jsonResp(page);
+    }
+    if ([path containsString:@"/direct_messages/events/show"]) {
+        NSDictionary *hit = dmFindEvent(query[@"id"]);
+        if (!hit) return notFoundResp();
+        return jsonResp(@{ @"event": dmEvent(hit[@"convo"], hit[@"msg"]) });
+    }
+    if ([method isEqual:@"POST"] && [path containsString:@"/direct_messages/events/new"]) {
+        return dmSend(body);
+    }
+    if ([path containsString:@"/direct_messages/events/destroy"]) {
+        // Bluesky only deletes a message for yourself, as Twitter did.
+        NSDictionary *ev = dmLookupEvent(query[@"id"]);
+        if (!ev) return notFoundResp();
+        NSString *err = nil;
+        id r = atpChat(@"POST", @"chat.bsky.convo.deleteMessageForSelf", nil, @{ @"convoId": ev[@"convoId"], @"messageId": ev[@"messageId"] }, &err);
+        if (!r) return errResp(err);
+        @synchronized (dmLock()) { [gDMMessages removeObjectForKey:ev[@"convoId"]]; } // refetch without it
+        return (BridgeResp){ 204, @"application/json", [NSData data] };
+    }
+
     // ---- user lookup ----
     if ([path containsString:@"/users/show"]) {
         NSDictionary *card = cardForId(query[@"user_id"]);
@@ -2053,8 +2624,11 @@ static void handleConnection(int fd) {
         @try { resp = routeRequest(httpMethod, path, query, body); }
         @catch (id e) { resp = errResp([NSString stringWithFormat:@"%@", e]); }
 
+        // X-Access-Level: Twitter's token permission. _PTHTweetbotAccountRequestOperation turns
+        // on the account's hasDirectMessageAccess only when a response says
+        // "read-write-directmessages"; without it the Messages tab never loads.
         NSMutableString *out = [NSMutableString stringWithFormat:
-            @"HTTP/1.1 %d %@\r\nContent-Type: %@\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n",
+            @"HTTP/1.1 %d %@\r\nContent-Type: %@\r\nContent-Length: %lu\r\nX-Access-Level: read-write-directmessages\r\nConnection: close\r\n\r\n",
             resp.status, resp.status == 200 ? @"OK" : @"Error", resp.contentType ?: @"application/json", (unsigned long)resp.body.length];
         NSData *headData = [out dataUsingEncoding:NSUTF8StringEncoding];
         writeAll(fd, headData.bytes, headData.length);

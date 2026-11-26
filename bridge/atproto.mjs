@@ -73,6 +73,18 @@ export class AtpClient {
     return this.#authed(this.pds, nsid, { method, params, body, proxy: "did:web:api.bsky.app#bsky_appview" });
   }
 
+  // Bluesky DMs (chat.bsky.*) also go through the PDS, proxied to the chat service. The
+  // app password must have been created with "Allow access to your direct messages".
+  async chat(nsid, { method = "GET", params, body } = {}) {
+    try {
+      return await this.#authed(this.pds, nsid, { method, params, body, proxy: "did:web:api.bsky.chat#bsky_chat" });
+    } catch (e) {
+      if (/scope/i.test(e.message)) // "Bad token scope"
+        throw new Error('Bluesky DMs need an app password created with "Allow access to your direct messages" ticked');
+      throw e;
+    }
+  }
+
   // ---- writes (com.atproto.repo.*) ----
   async createRecord(collection, record) {
     return this.call("com.atproto.repo.createRecord", { method: "POST", body: { repo: this.session.did, collection, record } });
