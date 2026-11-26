@@ -303,6 +303,57 @@ static void installLinkCardHooks(void) {
     tblog(@"link card hooks: row=%d detail=%d", orig_rowQuoteClicked != NULL, orig_detailQuoteClicked != NULL);
 }
 
+// ---- Tab shortcuts from any window -------------------------------------------
+// View → Tabs (Timeline ⌘1 … Lists ⌘8) sends a nil-targeted -changeTab: (the item's tag
+// picks the tab). Only PTHTweetbotMainViewController implements it, so it's in the
+// responder chain only while a main window is key or main: with a compose / drafts /
+// media / prefs window in front, or the main window minimised or closed, ⌘1 is disabled
+// and does nothing. Give PTHTweetbotAppDelegate (the chain's last stop) a -changeTab: that
+// brings the main window forward and hands it the action. The delegate's own
+// -validateMenuItem: already answers YES for actions it doesn't special-case.
+
+// The front-most of the delegate's main windows (one per account window), else any.
+static id frontMainWindowController(id delegate) {
+    NSArray *mwcs = [delegate respondsToSelector:sel_registerName("mainWindowControllers")]
+        ? msg0(delegate, "mainWindowControllers") : nil;
+    if (!mwcs.count) return nil;
+    id app = msg0((id)objc_getClass("NSApplication"), "sharedApplication");
+    for (id w in (NSArray *)msg0(app, "orderedWindows")) {
+        id wc = msg0(w, "windowController");
+        if (wc && [mwcs containsObject:wc]) return wc;
+    }
+    return mwcs.firstObject;
+}
+
+static void my_delegateChangeTab(id self, __unused SEL _cmd, id sender) {
+    @try {
+        id wc = frontMainWindowController(self);
+        if (!wc) {
+            // No main window open: same as File → New Window (needs an account).
+            NSArray *accounts = msg0((id)objc_getClass("PTHTweetbotAccount"), "accounts");
+            if (accounts.count) ((void(*)(id, SEL, id))objc_msgSend)(self, sel_registerName("newMainWindow:"), sender);
+            wc = frontMainWindowController(self);
+            if (!wc) return;
+        }
+        id win = msg0(wc, "window");
+        if (((BOOL(*)(id, SEL))objc_msgSend)(win, sel_registerName("isMiniaturized")))
+            ((void(*)(id, SEL, id))objc_msgSend)(win, sel_registerName("deminiaturize:"), nil);
+        ((void(*)(id, SEL, id))objc_msgSend)(win, sel_registerName("makeKeyAndOrderFront:"), nil);
+        // Call the main view controller directly (not a nil-targeted resend): the window
+        // may not be key yet (deminiaturize animates), which would route back here.
+        id vc = msg0(win, "contentViewController");
+        if ([vc respondsToSelector:@selector(changeTab:)])
+            ((void(*)(id, SEL, id))objc_msgSend)(vc, @selector(changeTab:), sender);
+    } @catch (id e) { tblog(@"changeTab fallback failed: %@", e); }
+}
+
+static void installTabShortcutFallback(void) {
+    Class d = objc_getClass("PTHTweetbotAppDelegate");
+    if (!d) { tblog(@"PTHTweetbotAppDelegate not found (no tab-shortcut fallback)"); return; }
+    BOOL added = class_addMethod(d, @selector(changeTab:), (IMP)my_delegateChangeTab, "v@:@");
+    tblog(@"tab-shortcut fallback on app delegate: %d", added);
+}
+
 __attribute__((constructor))
 static void tweetbot_atproto_init(void) {
     @autoreleasepool {
@@ -350,6 +401,7 @@ static void tweetbot_atproto_init(void) {
         neutralizeCloudKit();
         installWebURLHooks();
         installLinkCardHooks();
+        installTabShortcutFallback();
 
         tblog(@"redirector installed (NSURLSession + openURL hooks), bridge port %d", kBridgePort);
     }
