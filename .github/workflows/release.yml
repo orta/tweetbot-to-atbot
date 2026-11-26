@@ -86,12 +86,14 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          PRERELEASE=()
-          case "$TAG" in *-*) PRERELEASE=(--prerelease) ;; esac   # v1.0.0-beta.1 -> prerelease
+          # A string, not an array: the runner's /bin/bash is 3.2, where "${arr[@]}" of an
+          # empty array is an unbound-variable error under set -u (it broke v0.1.0's publish).
+          PRERELEASE=""
+          case "$TAG" in *-*) PRERELEASE="--prerelease" ;; esac   # v1.0.0-beta.1 -> prerelease
           gh release create "$TAG" \
             "${{ steps.build.outputs.zip }}" "${{ steps.build.outputs.sha256_file }}" \
             --title "Atbotify ${{ steps.build.outputs.version }}" \
-            --generate-notes --verify-tag "${PRERELEASE[@]}"
+            --generate-notes --verify-tag $PRERELEASE
 
       - name: Remove signing material
         if: always()
