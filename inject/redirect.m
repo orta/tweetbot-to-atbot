@@ -55,6 +55,17 @@ static NSURL *rewriteURL(NSURL *url) {
     return c.URL;
 }
 
+// A Bluesky HLS master playlist that Tweetbot is about to parse itself
+// (-[PTHTweetbotMediumMovie loadStreamData:]). Its format doesn't fit Tweetbot's parser,
+// so the bridge serves a rewritten copy (bridge.m hlsMasterForTweetbot). The bridge's own
+// upstream fetch carries X-Atbot-Upstream and passes through.
+static BOOL isBlueskyHLSMaster(NSURLRequest *req) {
+    NSString *host = req.URL.host.lowercaseString;
+    return ([host isEqualToString:@"bsky.app"] || [host hasSuffix:@".bsky.app"])
+        && [req.URL.path.lastPathComponent isEqualToString:@"playlist.m3u8"]
+        && ![req valueForHTTPHeaderField:@"X-Atbot-Upstream"];
+}
+
 // Return a request whose twitter URL is swapped for the loopback bridge, keeping
 // method, headers (incl. the OAuth Authorization header, which the bridge ignores)
 // and body intact. Non-twitter requests pass through untouched.
@@ -62,6 +73,16 @@ static NSURLRequest *rewriteRequest(NSURLRequest *req) {
     NSURL *url = req.URL;
     if (!url) return req;
     tblog(@"SEEN %@ %@", req.HTTPMethod ?: @"GET", url);
+    if (isBlueskyHLSMaster(req)) {
+        NSURLComponents *c = [NSURLComponents new];
+        c.scheme = @"http"; c.host = @"127.0.0.1"; c.port = @(kBridgePort);
+        c.path = @"/__hls/playlist.m3u8";
+        c.percentEncodedQuery = [@"url=" stringByAppendingString:
+            [url.absoluteString stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.alphanumericCharacterSet]];
+        NSMutableURLRequest *m = [req mutableCopy];
+        m.URL = c.URL;
+        return m;
+    }
     if (!isTwitterHost(url.host)) return req;
     NSMutableURLRequest *m = [req mutableCopy];
     m.URL = rewriteURL(url);

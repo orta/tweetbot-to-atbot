@@ -94,7 +94,9 @@ To test the UI without taking focus or moving the mouse: switch tabs with
 `perform action "AXPress" of menu item "<Likes|My Account|…>" of menu 1 of menu item "Tabs" of
 menu 1 of menu bar item "View"`, page a list by setting `value of scroll bar 1 of scroll area 1 of
 splitter group 1 of window 1` to 1.0, and capture the window even when it's covered with
-`screencapture -x -o -l <CGWindowID>` (find the id with JXA `CGWindowListCopyWindowInfo`). The
+`screencapture -x -o -l <CGWindowID>` (find the id with JXA `CGWindowListCopyWindowInfo`). To
+get a specific post on screen, run a search through the URL scheme:
+`open -g -b io.orta.atbot "atbot:///search?q=from%3A<handle>%20<words>"`. The
 compact sidebar icons and the profile's Followers/Following counts have no AX action and need a
 real click.
 
@@ -171,7 +173,17 @@ real click.
   no mp4). Map to Twitter media `type: "animated_gif"` / `"video"` with
   `video_info.variants: [{content_type: "application/x-mpegURL", url: playlist}]` and the
   thumbnail as `media_url_https`. `mediumWithEntity:` takes the first HLS variant (for `video`
-  under 4s it hunts for a `video/mp4` by bitrate, falling back to HLS), and AVPlayer streams it.
+  under 4s it hunts for a `video/mp4` by bitrate, falling back to HLS). Then
+  `-[PTHTweetbotMediumMovie loadStreamData:]` fetches that master playlist **itself** and
+  parses it with `RESOLUTION=(\d+)x(\d+),.*[\r\n]+(.*)` into best/fastest streams. A
+  scheme-less variant URI gets the master URL with its *whole path* replaced. Bluesky puts
+  `RESOLUTION` last (no comma after it) and uses relative URIs, so nothing parsed, best/fastest
+  were nil and nothing played. `redirect.m` sends Tweetbot's fetch of a `*.bsky.app/…/playlist.m3u8`
+  to the bridge's `/__hls/playlist.m3u8?url=`, which serves it with `RESOLUTION` first and
+  absolute URIs (`hlsMasterForTweetbot`). The bridge's upstream fetch carries `X-Atbot-Upstream`
+  so the hook doesn't loop it back. AVPlayer then pulls the variant playlists from Bluesky
+  directly. To check a playlist outside the app, `dlopen` Tweetbot's Model and run
+  `loadStreamData:` on a `PTHTweetbotMediumMovie`, then read `bestStream` / `fastestStream`.
 - **Link cards (OpenGraph)**: Tweetbot has no link-preview view (`PTHTweetbotCard` only scrapes
   media), so an `app.bsky.embed.external` is served as a synthetic `quoted_status` (`cardStatus`):
   title = user `name` (the bold line), host = `screen_name`, description + link = text, thumb = a

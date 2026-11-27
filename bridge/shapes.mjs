@@ -413,6 +413,34 @@ function tweetbotMediaURL(src) {
   if (ext) return `${src}.${ext}`;
   return src + (src.endsWith("@jpeg") ? ".jpg" : "@jpeg.jpg");
 }
+
+// Tweetbot parses an HLS master playlist itself (-[PTHTweetbotMediumMovie loadStreamData:],
+// Model) with /RESOLUTION=(\d+)x(\d+),.*[\r\n]+(.*)/i into best/fastest streams, and gives a
+// scheme-less variant URI the master URL with its WHOLE path replaced. Bluesky lists
+// RESOLUTION last on each #EXT-X-STREAM-INF line (no comma after it) and uses relative URIs
+// ("360p/video.m3u8?session_id=…"), so nothing parses, best/fastest stay nil and the player
+// never starts. Fix: RESOLUTION goes first in the attribute list and every URI is made
+// absolute against the master URL. redirect.m sends Tweetbot's fetch of a Bluesky
+// playlist.m3u8 to /__hls; AVPlayer then fetches the variant playlists from Bluesky itself.
+export function hlsMasterForTweetbot(body, base) {
+  const abs = (uri) => { try { return new URL(uri, base).href; } catch { return uri; } };
+  return body.split("\n").map((raw) => {
+    let line = raw.replace(/\r$/, "");
+    if (!line.startsWith("#")) return line.trim() ? abs(line) : line;
+    if (/^#EXT-X-STREAM-INF:/i.test(line)) {
+      const colon = line.indexOf(":") + 1;
+      const attrs = line.slice(colon);
+      const m = /(^|,)RESOLUTION=(\d+x\d+)(?=,|$)/i.exec(attrs);
+      if (m) {
+        const rest = (attrs.slice(0, m.index) + attrs.slice(m.index + m[0].length)).replace(/^,+|,+$/g, "");
+        line = `${line.slice(0, colon)}RESOLUTION=${m[2]}${rest ? `,${rest}` : ""}`;
+      }
+    }
+    // Tag attributes can carry URIs too (#EXT-X-MEDIA / #EXT-X-I-FRAME-STREAM-INF).
+    return line.replace(/URI="([^"]*)"/g, (_, uri) => `URI="${abs(uri)}"`);
+  }).join("\n");
+}
+
 // Twitter "sizes" entry scaled to fit `box` (keeps the real aspect ratio).
 function fitSize(w, h, box, resize) {
   const k = Math.min(1, box / Math.max(w, h));
@@ -548,7 +576,8 @@ function renderPost(rec, post, linkCard) {
   // Video (app.bsky.embed.video, also as recordWithMedia's media). Bluesky GIFs are
   // short videos with presentation "gif". Tweetbot's mediumWithEntity: takes the first
   // `application/x-mpegURL` variant for video/animated_gif (falling back to it when no
-  // mp4 exists), so the HLS playlist alone is enough; AVPlayer streams it.
+  // mp4 exists), so the HLS playlist alone is enough. Tweetbot then parses that master
+  // playlist itself, which Bluesky's needs rewriting for (hlsMasterForTweetbot, /__hls).
   // media_url_https is the poster frame and goes through the same URL rewriter as photos.
   const vid = post.embed?.$type === "app.bsky.embed.video#view" ? post.embed
     : post.embed?.media?.$type === "app.bsky.embed.video#view" ? post.embed.media : null;

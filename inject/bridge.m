@@ -71,9 +71,9 @@ static void loadCredentials(void) {
 // Runs on the server's background queue, so blocking is fine. Our own networking is
 // to atproto hosts (bsky.social / plc.directory / the PDS), which the redirector
 // leaves untouched (only *.twitter.com / push.tapbots.com get rewritten).
-static id httpRequestJSON(NSString *method, NSString *urlStr,
-                          NSDictionary<NSString *, NSString *> *headers,
-                          NSData *body, NSInteger *statusOut, NSString **errOut) {
+static NSData *httpRequestData(NSString *method, NSString *urlStr,
+                               NSDictionary<NSString *, NSString *> *headers,
+                               NSData *body, NSInteger *statusOut, NSString **errOut) {
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlStr]];
     req.HTTPMethod = method;
     for (NSString *k in headers) [req setValue:headers[k] forHTTPHeaderField:k];
@@ -92,6 +92,14 @@ static id httpRequestJSON(NSString *method, NSString *urlStr,
 
     if (statusOut) *statusOut = code;
     if (netErr) { if (errOut) *errOut = netErr.localizedDescription; return nil; }
+    return outData ?: [NSData data];
+}
+
+static id httpRequestJSON(NSString *method, NSString *urlStr,
+                          NSDictionary<NSString *, NSString *> *headers,
+                          NSData *body, NSInteger *statusOut, NSString **errOut) {
+    NSData *outData = httpRequestData(method, urlStr, headers, body, statusOut, errOut);
+    if (!outData) return nil;
     if (!outData.length) return @{};
     id json = [NSJSONSerialization JSONObjectWithData:outData options:0 error:NULL];
     if (!json) { // non-JSON body
@@ -583,6 +591,52 @@ static NSString *tweetbotMediaURL(NSString *src) {
     if (ext.length) return [src stringByAppendingFormat:@".%@", ext];
     return [src stringByAppendingString:[src hasSuffix:@"@jpeg"] ? @".jpg" : @"@jpeg.jpg"];
 }
+// Tweetbot parses an HLS master playlist itself (-[PTHTweetbotMediumMovie loadStreamData:],
+// Model) with /RESOLUTION=(\d+)x(\d+),.*[\r\n]+(.*)/i into best/fastest streams, and gives a
+// scheme-less variant URI the master URL with its WHOLE path replaced. Bluesky lists
+// RESOLUTION last on each #EXT-X-STREAM-INF line (no comma after it) and uses relative URIs
+// ("360p/video.m3u8?session_id=…"), so nothing parses, best/fastest stay nil and the player
+// never starts. Fix: RESOLUTION goes first in the attribute list and every URI is made
+// absolute against the master URL. redirect.m sends Tweetbot's fetch of a Bluesky
+// playlist.m3u8 to /__hls; AVPlayer then fetches the variant playlists from Bluesky itself.
+static NSString *absoluteURI(NSString *uri, NSURL *base) {
+    return [NSURL URLWithString:uri relativeToURL:base].absoluteString ?: uri;
+}
+static NSString *hlsMasterForTweetbot(NSString *body, NSURL *base) {
+    static NSRegularExpression *resRe, *uriRe; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        resRe = [NSRegularExpression regularExpressionWithPattern:@"(^|,)RESOLUTION=(\\d+x\\d+)(?=,|$)" options:NSRegularExpressionCaseInsensitive error:NULL];
+        uriRe = [NSRegularExpression regularExpressionWithPattern:@"URI=\"([^\"]*)\"" options:0 error:NULL];
+    });
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSString *raw in [body componentsSeparatedByString:@"\n"]) {
+        NSString *line = [raw hasSuffix:@"\r"] ? [raw substringToIndex:raw.length - 1] : raw;
+        if (![line hasPrefix:@"#"]) {
+            [out addObject:[line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet].length ? absoluteURI(line, base) : line];
+            continue;
+        }
+        if ([line.uppercaseString hasPrefix:@"#EXT-X-STREAM-INF:"]) {
+            NSUInteger colon = [line rangeOfString:@":"].location + 1;
+            NSString *attrs = [line substringFromIndex:colon];
+            NSTextCheckingResult *m = [resRe firstMatchInString:attrs options:0 range:NSMakeRange(0, attrs.length)];
+            if (m) {
+                NSString *rest = [attrs stringByReplacingCharactersInRange:m.range withString:@""];
+                rest = [rest stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@","]];
+                NSString *res = [attrs substringWithRange:[m rangeAtIndex:2]];
+                line = [NSString stringWithFormat:@"%@RESOLUTION=%@%@", [line substringToIndex:colon], res, rest.length ? [@"," stringByAppendingString:rest] : @""];
+            }
+        }
+        // Tag attributes can carry URIs too (#EXT-X-MEDIA / #EXT-X-I-FRAME-STREAM-INF).
+        NSMutableString *tag = [line mutableCopy];
+        for (NSTextCheckingResult *u in [[uriRe matchesInString:line options:0 range:NSMakeRange(0, line.length)] reverseObjectEnumerator]) {
+            NSString *abs = absoluteURI([line substringWithRange:[u rangeAtIndex:1]], base);
+            [tag replaceCharactersInRange:[u rangeAtIndex:1] withString:abs];
+        }
+        [out addObject:tag];
+    }
+    return [out componentsJoinedByString:@"\n"];
+}
+
 // Twitter "sizes" entry scaled to fit `box` (keeps the real aspect ratio).
 static NSDictionary *fitSize(double w, double h, double box, NSString *resize) {
     double k = MIN(1.0, box / MAX(w, h));
@@ -654,7 +708,8 @@ static NSDictionary *renderPost(NSDictionary *rec, NSDictionary *post, BOOL link
     // Video (app.bsky.embed.video, also as recordWithMedia's media). Bluesky GIFs are
     // short videos with presentation "gif". Tweetbot's mediumWithEntity: takes the first
     // `application/x-mpegURL` variant for video/animated_gif (falling back to it when no
-    // mp4 exists), so the HLS playlist alone is enough; AVPlayer streams it.
+    // mp4 exists), so the HLS playlist alone is enough. Tweetbot then parses that master
+    // playlist itself, which Bluesky's needs rewriting for (hlsMasterForTweetbot, /__hls).
     // media_url_https is the poster frame and goes through the same URL rewriter as photos.
     NSDictionary *vid = [embed[@"$type"] isEqual:@"app.bsky.embed.video#view"] ? embed
                       : [embed[@"media"][@"$type"] isEqual:@"app.bsky.embed.video#view"] ? embed[@"media"] : nil;
@@ -2304,6 +2359,24 @@ static BridgeResp routeRequest(NSString *method, NSString *path, NSDictionary *q
     // debug: current callback URL (manual delivery when the browser blocks JS redirect)
     if ([method isEqual:@"GET"] && [path hasSuffix:@"/__callback"]) {
         return rawResp([NSString stringWithFormat:@"atbot:///request_token?oauth_token=bridge-req-token&oauth_verifier=bridgeverifier&uuid=%@", gLastOAuthUuid ?: @""], @"text/plain");
+    }
+
+    // Tweetbot's own fetch of a Bluesky HLS master playlist, sent here by redirect.m:
+    // rewrite it into the shape Tweetbot's m3u8 parser reads (see hlsMasterForTweetbot).
+    // The upstream fetch is marked so redirect.m doesn't loop it back to us.
+    if ([method isEqual:@"GET"] && [path hasSuffix:@"/__hls/playlist.m3u8"]) {
+        NSURL *src = [NSURL URLWithString:query[@"url"] ?: @""];
+        NSString *host = src.host.lowercaseString;
+        if (![src.scheme isEqual:@"https"] || !([host isEqual:@"bsky.app"] || [host hasSuffix:@".bsky.app"]))
+            return (BridgeResp){ 400, @"text/plain", [NSData data] };
+        NSInteger code = 0; NSString *err = nil;
+        NSData *d = httpRequestData(@"GET", src.absoluteString, @{ @"X-Atbot-Upstream": @"1" }, nil, &code, &err);
+        NSString *text = d ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : nil;
+        if (code != 200 || !text) {
+            tblog(@"[bridge] hls %@ -> %ld %@", src, (long)code, err ?: @"");
+            return (BridgeResp){ code >= 400 ? (int)code : 502, @"text/plain", [NSData data] };
+        }
+        return rawResp(hlsMasterForTweetbot(text, src), @"application/vnd.apple.mpegurl");
     }
 
     // Everything below reads gDID, so the session must exist first (requests can

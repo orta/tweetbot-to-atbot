@@ -11,7 +11,7 @@ import http from "node:http";
 import { AtpClient } from "./atproto.mjs";
 import { userFromProfile, statusFromFeedItem, stableId, resolveActor, registerActor, resolvePostRef, cardForId, buildFacets, twitterList, findList, listViewName, numId, snowflakeId, keyHash, tidMs, isoMs, postId, dmEvent, dmEventId, dmOtherDid } from "./shapes.mjs";
 import fs from "node:fs";
-import { quotedPost, TWITTER_DATE } from "./shapes.mjs";
+import { quotedPost, TWITTER_DATE, hlsMasterForTweetbot } from "./shapes.mjs";
 
 const PORT = Number(process.env.BRIDGE_PORT || 8080);
 const atp = new AtpClient({ pds: process.env.BRIDGE_PDS || "https://bsky.social" });
@@ -51,6 +51,19 @@ const routes = [
   ["GET", /\/__callback$/, () => text(
     `atbot:///request_token?oauth_token=bridge-req-token&oauth_verifier=bridgeverifier&uuid=${encodeURIComponent(lastOAuthUuid || "")}`
   )],
+
+  // --- Tweetbot's own fetch of a Bluesky HLS master playlist, sent here by redirect.m:
+  //     rewrite it into the shape Tweetbot's m3u8 parser reads (hlsMasterForTweetbot). ---
+  ["GET", /\/__hls\/playlist\.m3u8$/, async (q) => {
+    const src = new URL(q.url || "", "http://invalid");
+    const host = src.hostname.toLowerCase();
+    if (src.protocol !== "https:" || !(host === "bsky.app" || host.endsWith(".bsky.app"))) {
+      return { __raw: true, status: 400, body: "", ct: "text/plain" };
+    }
+    const r = await fetch(src);
+    if (!r.ok) return { __raw: true, status: r.status, body: "", ct: "text/plain" };
+    return text(hlsMasterForTweetbot(await r.text(), src.href), "application/vnd.apple.mpegurl");
+  }],
 
   // --- OAuth 1.0a bootstrap: fake just enough for "Add Account" to complete ---
   ["POST", /\/oauth\/request_token$/, (q, req) => {
